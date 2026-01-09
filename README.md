@@ -8,6 +8,7 @@ A real-time terminal dashboard for monitoring SLURM cluster jobs and GPU availab
 ## Features
 
 - **Real-time job monitoring** - Auto-refreshing display of running and pending jobs
+- **Running summary** - Per-partition breakdown of running jobs and GPU usage
 - **GPU availability tracking** - Visual representation of GPU usage per partition
 - **Multiple view modes** - Full dashboard or compact table view
 - **User filtering** - Monitor your jobs or all cluster users
@@ -27,6 +28,15 @@ A real-time terminal dashboard for monitoring SLURM cluster jobs and GPU availab
 │ 12345 │ train_model     │ user │ A100    │ 4  │ 2:30:15││ A100    │ 8  │ 16  │
 │ 12346 │ inference       │ user │ RTX3090 │ 2  │ 0:45:22││ RTX3090 │ 12 │ 24  │
 └───────┴─────────────────┴──────┴─────────┴────┴────────┘└─────────┴────┴─────┘
+                   Running Summary
+╭───────────────────────┬─────────────┬─────────────╮
+│ Partition             │        Jobs │        GPUs │
+├───────────────────────┼─────────────┼─────────────┤
+│ A100                  │           8 │          32 │
+│ RTX3090               │           4 │           8 │
+├───────────────────────┼─────────────┼─────────────┤
+│ Total                 │          12 │          40 │
+╰───────────────────────┴─────────────┴─────────────╯
 ```
 
 ### Compact View
