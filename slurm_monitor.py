@@ -548,12 +548,10 @@ def main():
         if webhook_url:
             job_tracker = JobTracker(webhook_url=webhook_url, console=console)
             console.print(f"[green]Slack notifications enabled[/]")
-            # Send test notification
-            send_slack_notification(
-                webhook_url,
-                f":eyes: *SLURM Monitor Started*\nMonitoring jobs for user: `{user}`",
-                ":computer:"
-            )
+            # Initialize job tracker with current jobs (snooze first cycle)
+            initial_jobs = get_jobs(None if args.all_users else user)
+            job_tracker.previous_jobs = {job['id']: job for job in initial_jobs}
+            job_tracker.notified_starts = {job['id'] for job in initial_jobs if job['state'] == 'RUNNING'}
         else:
             console.print("[yellow]Warning: --slack enabled but no webhook URL found.[/]")
             console.print("[yellow]Set SLACK_WEBHOOK_URL in .env or use --slack-webhook[/]")
