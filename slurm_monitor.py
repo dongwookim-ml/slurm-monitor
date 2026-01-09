@@ -9,7 +9,11 @@ import argparse
 import time
 import os
 import sys
+import json
+import urllib.request
+import urllib.error
 from datetime import datetime
+from pathlib import Path
 
 try:
     from rich.console import Console
@@ -24,6 +28,149 @@ except ImportError:
     print("Install it with: pip install rich")
     sys.exit(1)
 
+
+# =============================================================================
+# Slack Notification Support
+# =============================================================================
+
+def load_env_file() -> dict:
+    """Load environment variables from .env file."""
+    env_vars = {}
+    env_paths = [
+        Path.cwd() / '.env',
+        Path.home() / '.slurm-monitor.env',
+        Path(__file__).parent / '.env',
+    ]
+
+    for env_path in env_paths:
+        if env_path.exists():
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        env_vars[key.strip()] = value.strip()
+            break
+    return env_vars
+
+
+def send_slack_notification(webhook_url: str, message: str, emoji: str = ":computer:") -> bool:
+    """Send a notification to Slack via webhook."""
+    if not webhook_url:
+        return False
+
+    payload = {
+        "text": message,
+        "icon_emoji": emoji,
+        "username": "SLURM Monitor"
+    }
+
+    try:
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
+            webhook_url,
+            data=data,
+            headers={'Content-Type': 'application/json'}
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.status == 200
+    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+        return False
+
+
+def format_job_notification(job: dict, event: str) -> tuple[str, str]:
+    """Format a job event notification message and emoji."""
+    job_id = job.get('id', 'unknown')
+    job_name = job.get('name', 'unknown')
+    partition = job.get('partition', 'unknown')
+    runtime = job.get('time', 'unknown')
+    gpus = job.get('gres', '').replace('gpu:', '') or '0'
+
+    if event == 'completed':
+        emoji = ":white_check_mark:"
+        message = f"*Job Completed*\n" \
+                  f"• ID: `{job_id}`\n" \
+                  f"• Name: *{job_name}*\n" \
+                  f"• Partition: {partition}\n" \
+                  f"• GPUs: {gpus}\n" \
+                  f"• Runtime: {runtime}"
+    elif event == 'failed':
+        emoji = ":x:"
+        message = f"*Job Failed*\n" \
+                  f"• ID: `{job_id}`\n" \
+                  f"• Name: *{job_name}*\n" \
+                  f"• Partition: {partition}\n" \
+                  f"• GPUs: {gpus}\n" \
+                  f"• Runtime: {runtime}"
+    elif event == 'started':
+        emoji = ":rocket:"
+        message = f"*Job Started*\n" \
+                  f"• ID: `{job_id}`\n" \
+                  f"• Name: *{job_name}*\n" \
+                  f"• Partition: {partition}\n" \
+                  f"• GPUs: {gpus}"
+    else:
+        emoji = ":information_source:"
+        message = f"*Job Update*: {job_id} - {job_name} ({event})"
+
+    return message, emoji
+
+
+class JobTracker:
+    """Track job state changes for notifications."""
+
+    def __init__(self, webhook_url: str = None, console: Console = None):
+        self.webhook_url = webhook_url
+        self.console = console or Console()
+        self.previous_jobs: dict[str, dict] = {}  # job_id -> job_info
+        self.notified_starts: set[str] = set()  # Track jobs we've notified about starting
+
+    def update(self, current_jobs: list[dict]) -> list[tuple[dict, str]]:
+        """Update job tracking and return list of (job, event) tuples."""
+        events = []
+        current_job_ids = {job['id'] for job in current_jobs}
+        current_jobs_map = {job['id']: job for job in current_jobs}
+
+        # Check for completed/failed jobs (were running, now gone)
+        for job_id, job_info in self.previous_jobs.items():
+            if job_id not in current_job_ids:
+                if job_info['state'] == 'RUNNING':
+                    # Job finished - assume completed (SLURM doesn't tell us exit status via squeue)
+                    events.append((job_info, 'completed'))
+
+        # Check for newly started jobs (were pending, now running)
+        for job_id, job_info in current_jobs_map.items():
+            if job_info['state'] == 'RUNNING' and job_id not in self.notified_starts:
+                prev_job = self.previous_jobs.get(job_id)
+                if prev_job is None or prev_job['state'] == 'PENDING':
+                    events.append((job_info, 'started'))
+                    self.notified_starts.add(job_id)
+
+        # Update previous jobs
+        self.previous_jobs = current_jobs_map.copy()
+
+        # Clean up notified_starts for jobs that no longer exist
+        self.notified_starts = self.notified_starts & current_job_ids
+
+        # Send notifications
+        for job, event in events:
+            self._notify(job, event)
+
+        return events
+
+    def _notify(self, job: dict, event: str):
+        """Send notification for a job event."""
+        message, emoji = format_job_notification(job, event)
+
+        if self.webhook_url:
+            success = send_slack_notification(self.webhook_url, message, emoji)
+            if success:
+                self.console.print(f"[dim]Slack notification sent: {event} - {job['name']}[/]")
+
+
+# =============================================================================
+# SLURM Commands
+# =============================================================================
 
 def run_command(cmd: str) -> str:
     """Run a shell command and return output."""
@@ -385,10 +532,31 @@ def main():
     parser.add_argument('--all-users', '-a', action='store_true', help="Show jobs from all users")
     parser.add_argument('--once', '-1', action='store_true', help="Run once and exit")
     parser.add_argument('--compact', '-c', action='store_true', help="Compact single-table view")
+    parser.add_argument('--slack', '-s', action='store_true', help="Enable Slack notifications for job events")
+    parser.add_argument('--slack-webhook', type=str, help="Slack webhook URL (overrides .env)")
     args = parser.parse_args()
 
     user = os.environ.get('USER', 'unknown')
     console = Console()
+
+    # Setup Slack notifications if enabled
+    job_tracker = None
+    if args.slack:
+        env_vars = load_env_file()
+        webhook_url = args.slack_webhook or env_vars.get('SLACK_WEBHOOK_URL')
+
+        if webhook_url:
+            job_tracker = JobTracker(webhook_url=webhook_url, console=console)
+            console.print(f"[green]Slack notifications enabled[/]")
+            # Send test notification
+            send_slack_notification(
+                webhook_url,
+                f":eyes: *SLURM Monitor Started*\nMonitoring jobs for user: `{user}`",
+                ":computer:"
+            )
+        else:
+            console.print("[yellow]Warning: --slack enabled but no webhook URL found.[/]")
+            console.print("[yellow]Set SLACK_WEBHOOK_URL in .env or use --slack-webhook[/]")
 
     if args.once:
         if args.compact:
@@ -402,13 +570,27 @@ def main():
             with Live(create_compact_view(user, args.all_users), refresh_per_second=1) as live:
                 while True:
                     time.sleep(args.interval)
+                    # Track job changes for Slack notifications
+                    if job_tracker:
+                        jobs = get_jobs(None if args.all_users else user)
+                        job_tracker.update(jobs)
                     live.update(create_compact_view(user, args.all_users))
         else:
             with Live(create_dashboard(user, args.all_users), refresh_per_second=1, screen=True) as live:
                 while True:
                     time.sleep(args.interval)
+                    # Track job changes for Slack notifications
+                    if job_tracker:
+                        jobs = get_jobs(None if args.all_users else user)
+                        job_tracker.update(jobs)
                     live.update(create_dashboard(user, args.all_users))
     except KeyboardInterrupt:
+        if job_tracker:
+            send_slack_notification(
+                job_tracker.webhook_url,
+                ":wave: *SLURM Monitor Stopped*",
+                ":computer:"
+            )
         console.print("\n[yellow]Monitor stopped.[/]")
 
 

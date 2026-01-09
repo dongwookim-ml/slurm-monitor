@@ -10,6 +10,7 @@ A real-time terminal dashboard for monitoring SLURM cluster jobs and GPU availab
 - **Real-time job monitoring** - Auto-refreshing display of running and pending jobs
 - **Running summary** - Per-partition breakdown of running jobs and GPU usage
 - **GPU availability tracking** - Visual representation of GPU usage per partition
+- **Slack notifications** - Get notified when jobs start or complete
 - **Multiple view modes** - Full dashboard or compact table view
 - **User filtering** - Monitor your jobs or all cluster users
 - **Rich terminal UI** - Beautiful tables and progress bars using the Rich library
@@ -123,6 +124,48 @@ alias sq='squeue -u $USER -o "%.10i %.25j %.10P %.8T %.10M %.10l %.4D %R"'
 | `--all-users` | `-a` | Show jobs from all users |
 | `--once` | `-1` | Run once and exit |
 | `--compact` | `-c` | Use compact single-table view |
+| `--slack` | `-s` | Enable Slack notifications |
+| `--slack-webhook` | | Slack webhook URL (overrides .env) |
+
+## Slack Notifications
+
+Get notified on Slack when your jobs start or complete.
+
+### Setup
+
+1. Create a Slack webhook:
+   - Go to [Slack API](https://api.slack.com/messaging/webhooks)
+   - Create an incoming webhook for your workspace
+   - Copy the webhook URL
+
+2. Save the webhook URL in a `.env` file:
+   ```bash
+   # In the slurm-monitor directory or ~/.slurm-monitor.env
+   SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
+   ```
+
+3. Run with Slack notifications enabled:
+   ```bash
+   slurm-monitor --slack
+   # Or with inline webhook URL
+   slurm-monitor --slack --slack-webhook "https://hooks.slack.com/services/..."
+   ```
+
+### Notification Events
+
+- **Job Started** :rocket: - When a pending job starts running
+- **Job Completed** :white_check_mark: - When a running job finishes
+- **Monitor Started/Stopped** - When the monitor begins or ends
+
+### Example Slack Message
+
+```
+🚀 Job Started
+• ID: 12345
+• Name: train_model
+• Partition: A100
+• GPUs: 4
+```
 
 ## Requirements
 
