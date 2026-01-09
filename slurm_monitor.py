@@ -152,20 +152,65 @@ class JobTracker:
         # Clean up notified_starts for jobs that no longer exist
         self.notified_starts = self.notified_starts & current_job_ids
 
-        # Send notifications
-        for job, event in events:
-            self._notify(job, event)
+        # Send merged notification if there are events
+        if events:
+            self._notify_batch(events)
 
         return events
 
-    def _notify(self, job: dict, event: str):
-        """Send notification for a job event."""
-        message, emoji = format_job_notification(job, event)
+    def _notify_batch(self, events: list[tuple[dict, str]]):
+        """Send a single merged notification for multiple job events."""
+        if not self.webhook_url or not events:
+            return
 
-        if self.webhook_url:
-            success = send_slack_notification(self.webhook_url, message, emoji)
-            if success:
-                self.console.print(f"[dim]Slack notification sent: {event} - {job['name']}[/]")
+        # Group events by type
+        started = [job for job, event in events if event == 'started']
+        completed = [job for job, event in events if event == 'completed']
+
+        # Build merged message
+        sections = []
+
+        if started:
+            if len(started) == 1:
+                job = started[0]
+                gpus = job.get('gres', '').replace('gpu:', '') or '0'
+                sections.append(
+                    f":rocket: *Job Started*\n"
+                    f"• `{job['id']}` *{job['name']}* ({job['partition']}, {gpus} GPUs)"
+                )
+            else:
+                lines = [f":rocket: *{len(started)} Jobs Started*"]
+                for job in started:
+                    gpus = job.get('gres', '').replace('gpu:', '') or '0'
+                    lines.append(f"• `{job['id']}` *{job['name']}* ({job['partition']}, {gpus} GPUs)")
+                sections.append("\n".join(lines))
+
+        if completed:
+            if len(completed) == 1:
+                job = completed[0]
+                gpus = job.get('gres', '').replace('gpu:', '') or '0'
+                sections.append(
+                    f":white_check_mark: *Job Completed*\n"
+                    f"• `{job['id']}` *{job['name']}* ({job['partition']}, {gpus} GPUs, {job.get('time', '?')})"
+                )
+            else:
+                lines = [f":white_check_mark: *{len(completed)} Jobs Completed*"]
+                for job in completed:
+                    gpus = job.get('gres', '').replace('gpu:', '') or '0'
+                    lines.append(f"• `{job['id']}` *{job['name']}* ({job['partition']}, {gpus} GPUs, {job.get('time', '?')})")
+                sections.append("\n".join(lines))
+
+        message = "\n\n".join(sections)
+        emoji = ":rocket:" if started and not completed else ":white_check_mark:" if completed else ":computer:"
+
+        success = send_slack_notification(self.webhook_url, message, emoji)
+        if success:
+            event_summary = []
+            if started:
+                event_summary.append(f"{len(started)} started")
+            if completed:
+                event_summary.append(f"{len(completed)} completed")
+            self.console.print(f"[dim]Slack notification sent: {', '.join(event_summary)}[/]")
 
 
 # =============================================================================
