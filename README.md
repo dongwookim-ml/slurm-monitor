@@ -8,9 +8,9 @@ A real-time terminal dashboard for monitoring SLURM cluster jobs and GPU availab
 ## Features
 
 - **Real-time job monitoring** - Auto-refreshing display of running and pending jobs
-- **Running summary** - Per-partition breakdown of running jobs and GPU usage
+- **Job summary** - Per-partition breakdown of running/pending jobs and GPU usage
 - **GPU availability tracking** - Visual representation of GPU usage per partition
-- **Slack notifications** - Get notified when jobs start or complete
+- **Slack notifications** - Get notified when jobs start or complete (with batched messages)
 - **Multiple view modes** - Full dashboard or compact table view
 - **User filtering** - Monitor your jobs or all cluster users
 - **Rich terminal UI** - Beautiful tables and progress bars using the Rich library
@@ -29,15 +29,15 @@ A real-time terminal dashboard for monitoring SLURM cluster jobs and GPU availab
 │ 12345 │ train_model     │ user │ A100    │ 4  │ 2:30:15││ A100    │ 8  │ 16  │
 │ 12346 │ inference       │ user │ RTX3090 │ 2  │ 0:45:22││ RTX3090 │ 12 │ 24  │
 └───────┴─────────────────┴──────┴─────────┴────┴────────┘└─────────┴────┴─────┘
-                   Running Summary
-╭───────────────────────┬─────────────┬─────────────╮
-│ Partition             │        Jobs │        GPUs │
-├───────────────────────┼─────────────┼─────────────┤
-│ A100                  │           8 │          32 │
-│ RTX3090               │           4 │           8 │
-├───────────────────────┼─────────────┼─────────────┤
-│ Total                 │          12 │          40 │
-╰───────────────────────┴─────────────┴─────────────╯
+                        Summary
+╭───────────────────┬───────┬───────┬───────╮
+│ Partition         │   Run │  Pend │  GPUs │
+├───────────────────┼───────┼───────┼───────┤
+│ A100              │     8 │     2 │    32 │
+│ RTX3090           │     4 │     - │     8 │
+├───────────────────┼───────┼───────┼───────┤
+│ Total             │    12 │     2 │    40 │
+╰───────────────────┴───────┴───────┴───────╯
 ```
 
 ### Compact View
@@ -155,16 +155,27 @@ Get notified on Slack when your jobs start or complete.
 
 - **Job Started** :rocket: - When a pending job starts running
 - **Job Completed** :white_check_mark: - When a running job finishes
-- **Monitor Started/Stopped** - When the monitor begins or ends
 
-### Example Slack Message
+Multiple events in one monitoring cycle are batched into a single message.
 
+### Example Slack Messages
+
+Single job:
 ```
 🚀 Job Started
-• ID: 12345
-• Name: train_model
-• Partition: A100
-• GPUs: 4
+• `12345` train_model (A100, 4 GPUs)
+```
+
+Multiple jobs (batched):
+```
+🚀 3 Jobs Started
+• `12345` train_model (A100, 4 GPUs)
+• `12346` inference (RTX3090, 2 GPUs)
+• `12347` preprocess (A5000, 1 GPUs)
+
+✅ 2 Jobs Completed
+• `12340` old_job (A100, 4 GPUs, 2:30:15)
+• `12341` another_job (RTX3090, 1 GPUs, 1:45:22)
 ```
 
 ## Requirements
