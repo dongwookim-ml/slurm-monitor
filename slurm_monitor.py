@@ -514,10 +514,11 @@ def create_dashboard(user: str, show_all: bool) -> Layout:
 
     # Header
     user_display = "All Users" if show_all else user
+    gpus_total = sum(p['total'] for p in gpu_info)
     header_text = Text()
     header_text.append("  SLURM Job Monitor", style="bold white")
     header_text.append(f"  |  User: {user_display}", style="cyan")
-    header_text.append(f"  |  GPUs in use: {cluster['gpus_in_use']}", style="yellow")
+    header_text.append(f"  |  GPUs: {cluster['gpus_in_use']}/{gpus_total}", style="yellow")
     header_text.append(f"  |  {datetime.now().strftime('%H:%M:%S')}", style="dim")
     layout["header"].update(Panel(header_text, style="blue"))
 
