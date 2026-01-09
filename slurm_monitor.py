@@ -145,6 +145,64 @@ def get_gpu_availability() -> list[dict]:
     return [{'name': k, **v} for k, v in partitions.items()]
 
 
+def get_partition_summary(jobs: list[dict]) -> list[dict]:
+    """Get summary of running jobs and GPU usage per partition."""
+    summary = {}
+    for job in jobs:
+        if job['state'] != 'RUNNING':
+            continue
+        partition = job['partition']
+        if partition not in summary:
+            summary[partition] = {'jobs': 0, 'gpus': 0}
+        summary[partition]['jobs'] += 1
+        # Parse GPU count from gres
+        gres = job['gres']
+        if 'gpu:' in gres:
+            gpu_str = gres.split('gpu:')[1].split(',')[0].split('(')[0]
+            # Handle formats like "gpu:4" or "gpu:A100:4"
+            if ':' in gpu_str:
+                gpu_count = gpu_str.split(':')[-1]
+            else:
+                gpu_count = gpu_str
+            try:
+                summary[partition]['gpus'] += int(gpu_count)
+            except ValueError:
+                pass
+    return [{'partition': k, **v} for k, v in sorted(summary.items())]
+
+
+def create_summary_table(jobs: list[dict]) -> Table:
+    """Create a summary table showing jobs and GPUs per partition."""
+    summary = get_partition_summary(jobs)
+
+    table = Table(
+        title="Running Summary",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+        title_style="bold white",
+        expand=True
+    )
+
+    table.add_column("Partition", style="green", width=12)
+    table.add_column("Jobs", style="yellow", justify="right", width=6)
+    table.add_column("GPUs", style="magenta", justify="right", width=6)
+
+    total_jobs = 0
+    total_gpus = 0
+    for s in summary:
+        table.add_row(s['partition'], str(s['jobs']), str(s['gpus']))
+        total_jobs += s['jobs']
+        total_gpus += s['gpus']
+
+    if summary:
+        table.add_section()
+        table.add_row("[bold]Total[/]", f"[bold]{total_jobs}[/]", f"[bold]{total_gpus}[/]")
+    else:
+        table.add_row("-", "0", "0")
+
+    return table
+
+
 def create_job_table(jobs: list[dict], title: str, state_filter: str = None) -> Table:
     """Create a rich table for jobs."""
     filtered = [j for j in jobs if state_filter is None or j['state'] == state_filter]
@@ -247,8 +305,9 @@ def create_dashboard(user: str, show_all: bool) -> Layout:
     )
 
     layout["left"].split_column(
-        Layout(name="running"),
-        Layout(name="pending")
+        Layout(name="running", ratio=2),
+        Layout(name="summary", size=12),
+        Layout(name="pending", ratio=2)
     )
 
     # Header
@@ -265,6 +324,7 @@ def create_dashboard(user: str, show_all: bool) -> Layout:
     pending_jobs = [j for j in jobs if j['state'] == 'PENDING']
 
     layout["running"].update(create_job_table(jobs, f"Running Jobs ({len(running_jobs)})", "RUNNING"))
+    layout["summary"].update(create_summary_table(jobs))
     layout["pending"].update(create_job_table(jobs, f"Pending Jobs ({len(pending_jobs)})", "PENDING"))
 
     # GPU availability
