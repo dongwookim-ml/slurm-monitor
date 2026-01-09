@@ -338,37 +338,42 @@ def get_gpu_availability() -> list[dict]:
 
 
 def get_partition_summary(jobs: list[dict]) -> list[dict]:
-    """Get summary of running jobs and GPU usage per partition."""
+    """Get summary of running and pending jobs per partition."""
     summary = {}
     for job in jobs:
-        if job['state'] != 'RUNNING':
-            continue
         partition = job['partition']
+        state = job['state']
+
         if partition not in summary:
-            summary[partition] = {'jobs': 0, 'gpus': 0}
-        summary[partition]['jobs'] += 1
-        # Parse GPU count from gres
-        gres = job['gres']
-        if 'gpu:' in gres:
-            gpu_str = gres.split('gpu:')[1].split(',')[0].split('(')[0]
-            # Handle formats like "gpu:4" or "gpu:A100:4"
-            if ':' in gpu_str:
-                gpu_count = gpu_str.split(':')[-1]
-            else:
-                gpu_count = gpu_str
-            try:
-                summary[partition]['gpus'] += int(gpu_count)
-            except ValueError:
-                pass
+            summary[partition] = {'running': 0, 'pending': 0, 'gpus': 0}
+
+        if state == 'RUNNING':
+            summary[partition]['running'] += 1
+            # Parse GPU count from gres
+            gres = job['gres']
+            if 'gpu:' in gres:
+                gpu_str = gres.split('gpu:')[1].split(',')[0].split('(')[0]
+                # Handle formats like "gpu:4" or "gpu:A100:4"
+                if ':' in gpu_str:
+                    gpu_count = gpu_str.split(':')[-1]
+                else:
+                    gpu_count = gpu_str
+                try:
+                    summary[partition]['gpus'] += int(gpu_count)
+                except ValueError:
+                    pass
+        elif state == 'PENDING':
+            summary[partition]['pending'] += 1
+
     return [{'partition': k, **v} for k, v in sorted(summary.items())]
 
 
 def create_summary_table(jobs: list[dict]) -> Table:
-    """Create a summary table showing jobs and GPUs per partition."""
+    """Create a summary table showing running/pending jobs and GPUs per partition."""
     summary = get_partition_summary(jobs)
 
     table = Table(
-        title="Running Summary",
+        title="Summary",
         box=box.ROUNDED,
         header_style="bold cyan",
         title_style="bold white",
@@ -376,21 +381,26 @@ def create_summary_table(jobs: list[dict]) -> Table:
     )
 
     table.add_column("Partition", style="green", width=12)
-    table.add_column("Jobs", style="yellow", justify="right", width=6)
-    table.add_column("GPUs", style="magenta", justify="right", width=6)
+    table.add_column("Run", style="yellow", justify="right", width=5)
+    table.add_column("Pend", style="red", justify="right", width=5)
+    table.add_column("GPUs", style="magenta", justify="right", width=5)
 
-    total_jobs = 0
+    total_running = 0
+    total_pending = 0
     total_gpus = 0
     for s in summary:
-        table.add_row(s['partition'], str(s['jobs']), str(s['gpus']))
-        total_jobs += s['jobs']
+        pend_str = str(s['pending']) if s['pending'] > 0 else "-"
+        table.add_row(s['partition'], str(s['running']), pend_str, str(s['gpus']))
+        total_running += s['running']
+        total_pending += s['pending']
         total_gpus += s['gpus']
 
     if summary:
         table.add_section()
-        table.add_row("[bold]Total[/]", f"[bold]{total_jobs}[/]", f"[bold]{total_gpus}[/]")
+        pend_total = str(total_pending) if total_pending > 0 else "-"
+        table.add_row("[bold]Total[/]", f"[bold]{total_running}[/]", f"[bold]{pend_total}[/]", f"[bold]{total_gpus}[/]")
     else:
-        table.add_row("-", "0", "0")
+        table.add_row("-", "0", "-", "0")
 
     return table
 
