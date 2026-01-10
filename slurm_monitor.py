@@ -337,6 +337,69 @@ def get_gpu_availability() -> list[dict]:
     return [{'name': k, **v} for k, v in partitions.items()]
 
 
+def get_partition_nodes(partition: str) -> list[dict]:
+    """Get per-node GPU and CPU availability for a specific partition."""
+    cmd = f"sinfo -N -p {partition} -o '%N|%t|%C|%G' --noheader"
+    output = run_command(cmd)
+
+    nodes = []
+    if output and not output.startswith("Error"):
+        for line in output.split('\n'):
+            if line.strip():
+                parts = line.split('|')
+                if len(parts) >= 4:
+                    name = parts[0].strip()
+                    state = parts[1].strip()
+                    cpu_info = parts[2].strip()
+                    gres = parts[3].strip()
+
+                    # Parse CPU info: allocated/idle/other/total
+                    cpus_alloc, cpus_idle, cpus_other, cpus_total = 0, 0, 0, 0
+                    if '/' in cpu_info:
+                        cpu_parts = cpu_info.split('/')
+                        if len(cpu_parts) == 4:
+                            cpus_alloc = int(cpu_parts[0]) if cpu_parts[0].isdigit() else 0
+                            cpus_idle = int(cpu_parts[1]) if cpu_parts[1].isdigit() else 0
+                            cpus_other = int(cpu_parts[2]) if cpu_parts[2].isdigit() else 0
+                            cpus_total = int(cpu_parts[3]) if cpu_parts[3].isdigit() else 0
+
+                    # Parse GPU info from GRES
+                    gpus_total = 0
+                    gpu_type = ""
+                    if 'gpu:' in gres:
+                        gpu_part = gres.split('gpu:')[1].split('(')[0]
+                        if ':' in gpu_part:
+                            gpu_type, gpu_count_str = gpu_part.rsplit(':', 1)
+                            gpus_total = int(gpu_count_str) if gpu_count_str.isdigit() else 0
+                        else:
+                            gpus_total = int(gpu_part) if gpu_part.isdigit() else 0
+
+                    # Calculate available GPUs based on state
+                    if state == 'idle':
+                        gpus_avail = gpus_total
+                    elif state == 'mix':
+                        # For mix state, estimate based on CPU usage ratio
+                        if cpus_total > 0:
+                            usage_ratio = cpus_alloc / cpus_total
+                            gpus_avail = max(0, int(gpus_total * (1 - usage_ratio)))
+                        else:
+                            gpus_avail = gpus_total // 2
+                    else:  # alloc, down, drain, etc.
+                        gpus_avail = 0
+
+                    nodes.append({
+                        'name': name,
+                        'state': state,
+                        'cpus_alloc': cpus_alloc,
+                        'cpus_total': cpus_total,
+                        'gpus_avail': gpus_avail,
+                        'gpus_total': gpus_total,
+                        'gpu_type': gpu_type
+                    })
+
+    return sorted(nodes, key=lambda x: x['name'])
+
+
 def get_partition_summary(jobs: list[dict]) -> list[dict]:
     """Get summary of running and pending jobs per partition."""
     summary = {}
@@ -484,6 +547,98 @@ def create_gpu_table(gpu_info: list[dict]) -> Table:
     return table
 
 
+def create_partition_detail_table(partition: str) -> Table:
+    """Create a table showing per-node GPU and CPU availability for a partition."""
+    nodes = get_partition_nodes(partition)
+
+    table = Table(
+        title=f"Partition: {partition}",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+        title_style="bold white",
+    )
+
+    table.add_column("Node", style="cyan", width=20)
+    table.add_column("State", width=10)
+    table.add_column("CPUs", width=18)
+    table.add_column("GPUs", width=18)
+
+    # State color mapping
+    state_colors = {
+        'idle': 'green',
+        'mix': 'yellow',
+        'alloc': 'red',
+        'allocated': 'red',
+        'down': 'dim',
+        'drain': 'dim',
+        'drng': 'dim',
+    }
+
+    totals = {'cpus_alloc': 0, 'cpus_total': 0, 'gpus_avail': 0, 'gpus_total': 0}
+
+    for node in nodes:
+        state = node['state']
+        state_color = state_colors.get(state, 'white')
+
+        # CPU usage bar
+        cpu_alloc = node['cpus_alloc']
+        cpu_total = node['cpus_total']
+        if cpu_total > 0:
+            cpu_usage_pct = (cpu_alloc / cpu_total) * 100
+            cpu_bar_width = 8
+            cpu_filled = int(cpu_usage_pct / 100 * cpu_bar_width)
+            cpu_bar = "[red]" + "█" * cpu_filled + "[green]" + "█" * (cpu_bar_width - cpu_filled) + "[/]"
+            cpu_text = f"{cpu_alloc:>3}/{cpu_total:<3} {cpu_bar}"
+        else:
+            cpu_text = "-"
+
+        # GPU usage bar
+        gpu_avail = node['gpus_avail']
+        gpu_total = node['gpus_total']
+        if gpu_total > 0:
+            gpu_usage_pct = ((gpu_total - gpu_avail) / gpu_total) * 100
+            gpu_bar_width = 8
+            gpu_filled = int(gpu_usage_pct / 100 * gpu_bar_width)
+            gpu_bar = "[red]" + "█" * gpu_filled + "[green]" + "█" * (gpu_bar_width - gpu_filled) + "[/]"
+            gpu_text = f"{gpu_avail:>2}/{gpu_total:<2} {gpu_bar}"
+        else:
+            gpu_text = "-"
+
+        table.add_row(
+            node['name'],
+            f"[{state_color}]{state}[/]",
+            cpu_text,
+            gpu_text
+        )
+
+        totals['cpus_alloc'] += cpu_alloc
+        totals['cpus_total'] += cpu_total
+        totals['gpus_avail'] += gpu_avail
+        totals['gpus_total'] += gpu_total
+
+    # Add totals row
+    if nodes:
+        table.add_section()
+        if totals['cpus_total'] > 0:
+            cpu_total_text = f"{totals['cpus_alloc']}/{totals['cpus_total']}"
+        else:
+            cpu_total_text = "-"
+        if totals['gpus_total'] > 0:
+            gpu_total_text = f"{totals['gpus_avail']}/{totals['gpus_total']}"
+        else:
+            gpu_total_text = "-"
+        table.add_row(
+            f"[bold]Total ({len(nodes)} nodes)[/]",
+            "",
+            f"[bold]{cpu_total_text}[/]",
+            f"[bold]{gpu_total_text}[/]"
+        )
+    else:
+        table.add_row("-", f"No nodes found in partition '{partition}'", "-", "-")
+
+    return table
+
+
 def create_dashboard(user: str, show_all: bool) -> Layout:
     """Create the main dashboard layout."""
     console = Console()
@@ -582,12 +737,39 @@ def create_compact_view(user: str, show_all: bool) -> Table:
     return table
 
 
+def create_partition_view(partition: str) -> Layout:
+    """Create a view showing detailed node information for a partition."""
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="main"),
+    )
+
+    # Header
+    header = Panel(
+        Text(
+            f"SLURM Partition Detail  |  Partition: {partition}  |  {datetime.now().strftime('%H:%M:%S')}",
+            justify="center",
+            style="bold white"
+        ),
+        box=box.ROUNDED,
+        style="cyan"
+    )
+    layout["header"].update(header)
+
+    # Main content
+    layout["main"].update(create_partition_detail_table(partition))
+
+    return layout
+
+
 def main():
     parser = argparse.ArgumentParser(description="SLURM Job Monitor")
     parser.add_argument('--interval', '-i', type=int, default=5, help="Refresh interval in seconds")
     parser.add_argument('--all-users', '-a', action='store_true', help="Show jobs from all users")
     parser.add_argument('--once', '-1', action='store_true', help="Run once and exit")
     parser.add_argument('--compact', '-c', action='store_true', help="Compact single-table view")
+    parser.add_argument('--partition', '-p', type=str, default=None, help="Show detailed node info for specific partition")
     parser.add_argument('--slack', '-s', action='store_true', help="Enable Slack notifications for job events")
     parser.add_argument('--slack-webhook', type=str, help="Slack webhook URL (overrides .env)")
     args = parser.parse_args()
@@ -613,14 +795,21 @@ def main():
             console.print("[yellow]Set SLACK_WEBHOOK_URL in .env or use --slack-webhook[/]")
 
     if args.once:
-        if args.compact:
+        if args.partition:
+            console.print(create_partition_view(args.partition))
+        elif args.compact:
             console.print(create_compact_view(user, args.all_users))
         else:
             console.print(create_dashboard(user, args.all_users))
         return
 
     try:
-        if args.compact:
+        if args.partition:
+            with Live(create_partition_view(args.partition), refresh_per_second=1, screen=True) as live:
+                while True:
+                    time.sleep(args.interval)
+                    live.update(create_partition_view(args.partition))
+        elif args.compact:
             with Live(create_compact_view(user, args.all_users), refresh_per_second=1) as live:
                 while True:
                     time.sleep(args.interval)
