@@ -515,8 +515,42 @@ def create_job_table(jobs: list[dict], title: str, state_filter: str = None) -> 
     return table
 
 
-def create_gpu_table(gpu_info: list[dict]) -> Table:
-    """Create GPU availability table."""
+def get_user_gpu_usage(jobs: list[dict], username: str) -> dict:
+    """Compute per-partition GPU usage split by current user vs others.
+
+    Returns dict keyed by partition: {'my_gpus': int, 'others_gpus': int}
+    """
+    usage = {}
+    for job in jobs:
+        if job['state'] != 'RUNNING':
+            continue
+        partition = job['partition']
+        if partition not in usage:
+            usage[partition] = {'my_gpus': 0, 'others_gpus': 0}
+
+        gpu_count = 0
+        gres = job['gres']
+        if 'gpu:' in gres:
+            gpu_str = gres.split('gpu:')[1].split(',')[0].split('(')[0]
+            if ':' in gpu_str:
+                gpu_count_str = gpu_str.split(':')[-1]
+            else:
+                gpu_count_str = gpu_str
+            try:
+                gpu_count = int(gpu_count_str)
+            except ValueError:
+                pass
+
+        if job['user'] == username:
+            usage[partition]['my_gpus'] += gpu_count
+        else:
+            usage[partition]['others_gpus'] += gpu_count
+
+    return usage
+
+
+def create_gpu_table(gpu_info: list[dict], user_gpu_usage: dict = None) -> Table:
+    """Create GPU availability table with per-user breakdown."""
     table = Table(
         title="GPU Availability",
         box=box.ROUNDED,
@@ -525,20 +559,33 @@ def create_gpu_table(gpu_info: list[dict]) -> Table:
     )
 
     table.add_column("Partition", style="green", width=15)
+    table.add_column("Mine", style="blue", justify="right", width=6)
     table.add_column("Available", style="yellow", justify="right", width=10)
     table.add_column("Total", style="dim", justify="right", width=10)
     table.add_column("Usage", width=20)
+
+    if user_gpu_usage is None:
+        user_gpu_usage = {}
 
     for p in sorted(gpu_info, key=lambda x: x['name']):
         if p['total'] > 0:
             usage_pct = ((p['total'] - p['idle']) / p['total']) * 100 if p['total'] > 0 else 0
             bar_width = 15
-            filled = int(usage_pct / 100 * bar_width)
-            bar = "[green]" + "█" * (bar_width - filled) + "[red]" + "█" * filled + "[/]"
+
+            partition_usage = user_gpu_usage.get(p['name'], {'my_gpus': 0, 'others_gpus': 0})
+            my_gpus = partition_usage['my_gpus']
+            others_gpus = partition_usage['others_gpus']
+
+            my_blocks = int(my_gpus / p['total'] * bar_width) if p['total'] > 0 else 0
+            others_blocks = int(others_gpus / p['total'] * bar_width) if p['total'] > 0 else 0
+            idle_blocks = bar_width - my_blocks - others_blocks
+            bar = "[blue]" + "█" * my_blocks + "[red]" + "█" * others_blocks + "[green]" + "█" * idle_blocks + "[/]"
 
             avail_style = "green" if p['idle'] > 0 else "red"
+            my_str = str(my_gpus) if my_gpus > 0 else "-"
             table.add_row(
                 p['name'],
+                f"[blue]{my_str}[/]",
                 f"[{avail_style}]{p['idle']}[/]",
                 str(p['total']),
                 bar + f" {usage_pct:.0f}%"
@@ -644,9 +691,11 @@ def create_dashboard(user: str, show_all: bool) -> Layout:
     console = Console()
 
     # Get data
-    jobs = get_jobs(None if show_all else user)
+    all_jobs = get_jobs()
+    jobs = all_jobs if show_all else [j for j in all_jobs if j['user'] == user]
     gpu_info = get_gpu_availability()
     cluster = get_cluster_summary()
+    user_gpu_usage = get_user_gpu_usage(all_jobs, user)
 
     # Create layout
     layout = Layout()
@@ -686,7 +735,7 @@ def create_dashboard(user: str, show_all: bool) -> Layout:
     layout["pending"].update(create_job_table(jobs, f"Pending Jobs ({len(pending_jobs)})", "PENDING"))
 
     # GPU availability
-    layout["right"].update(create_gpu_table(gpu_info))
+    layout["right"].update(create_gpu_table(gpu_info, user_gpu_usage))
 
     # Footer
     footer_text = Text()
