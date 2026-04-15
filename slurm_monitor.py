@@ -287,7 +287,7 @@ def get_cluster_summary() -> dict:
                     })
 
     # Get GPU usage
-    cmd = "squeue -o '%b' --noheader | grep gpu | sed 's/.*gpu://' | sed 's/,.*//' | awk '{s+=$1} END {print s}'"
+    cmd = "squeue -t RUNNING -o '%b' --noheader | grep gpu | sed 's/.*gpu://' | sed 's/,.*//' | sed 's/.*://' | awk '{s+=$1} END {print s}'"
     gpus_in_use = run_command(cmd)
     gpus_in_use = int(gpus_in_use) if gpus_in_use.isdigit() else 0
 
@@ -302,6 +302,7 @@ def get_cluster_summary() -> dict:
 
 def get_gpu_availability() -> list[dict]:
     """Get GPU availability per partition."""
+    # Get total GPUs per partition from sinfo
     cmd = "sinfo -o '%P|%G|%D|%t|%C' --noheader"
     output = run_command(cmd)
 
@@ -314,13 +315,12 @@ def get_gpu_availability() -> list[dict]:
                     name = parts[0].strip().rstrip('*')
                     gres = parts[1].strip()
                     nodes = int(parts[2].strip()) if parts[2].strip().isdigit() else 0
-                    state = parts[3].strip()
 
                     # Parse GPU info
                     gpu_count = 0
                     gpu_type = ""
                     if 'gpu:' in gres:
-                        gpu_part = gres.split('gpu:')[1].split('(')[0]
+                        gpu_part = gres.split('gpu:')[1].split(',')[0].split('(')[0]
                         if ':' in gpu_part:
                             gpu_type, gpu_count = gpu_part.rsplit(':', 1)
                             gpu_count = int(gpu_count) if gpu_count.isdigit() else 0
@@ -331,8 +331,35 @@ def get_gpu_availability() -> list[dict]:
                         partitions[name] = {'total': 0, 'idle': 0, 'gpu_type': gpu_type}
 
                     partitions[name]['total'] += nodes * gpu_count
-                    if state in ['idle', 'mix']:
-                        partitions[name]['idle'] += nodes * gpu_count if state == 'idle' else nodes * gpu_count // 2
+
+    # Get per-partition GPU usage from running jobs via squeue
+    cmd = "squeue -t RUNNING -o '%P|%b|%D' --noheader"
+    output = run_command(cmd)
+
+    gpu_in_use = {}
+    if output and not output.startswith("Error"):
+        for line in output.split('\n'):
+            if line.strip():
+                parts = line.split('|')
+                if len(parts) >= 3:
+                    partition = parts[0].strip()
+                    gres = parts[1].strip()
+                    job_nodes = int(parts[2].strip()) if parts[2].strip().isdigit() else 1
+                    if 'gpu:' in gres:
+                        gpu_str = gres.split('gpu:')[1].split(',')[0].split('(')[0]
+                        if ':' in gpu_str:
+                            count_str = gpu_str.split(':')[-1]
+                        else:
+                            count_str = gpu_str
+                        try:
+                            gpu_in_use[partition] = gpu_in_use.get(partition, 0) + int(count_str) * job_nodes
+                        except ValueError:
+                            pass
+
+    # Available = total - in_use
+    for name, info in partitions.items():
+        used = gpu_in_use.get(name, 0)
+        info['idle'] = max(0, info['total'] - used)
 
     return [{'name': k, **v} for k, v in partitions.items()]
 
@@ -367,7 +394,7 @@ def get_partition_nodes(partition: str) -> list[dict]:
                     gpus_total = 0
                     gpu_type = ""
                     if 'gpu:' in gres:
-                        gpu_part = gres.split('gpu:')[1].split('(')[0]
+                        gpu_part = gres.split('gpu:')[1].split(',')[0].split('(')[0]
                         if ':' in gpu_part:
                             gpu_type, gpu_count_str = gpu_part.rsplit(':', 1)
                             gpus_total = int(gpu_count_str) if gpu_count_str.isdigit() else 0
