@@ -1,0 +1,5 @@
+{"errors": [], "jobs": [
+ {"job_id": 101, "name": "train|phase2[/red]", "user_name": "alice", "partition": "gpu", "job_state": ["RUNNING"], "node_count": 2, "cpus": 16, "time_limit": {"set": true, "infinite": false, "number": 60}, "tres_alloc_str": "cpu=16,node=2,gres/gpu=8,gres/gpu:a100=8", "tres_req_str": "cpu=16,node=2,gres/gpu=8,gres/gpu:a100=8", "tres_per_node": "gres/gpu:a100:4", "submit_time": 1000, "start_time": 2000, "end_time": 0, "account": "research", "qos": "normal"},
+ {"job_id": 102, "name": "pending", "user_name": "alice", "partition": "gpu,shared", "job_state": "PENDING", "node_count": {"set": true, "infinite": false, "number": 1}, "cpus": {"set": true, "infinite": false, "number": 4}, "time_limit": 30, "tres_alloc_str": "", "tres_req_str": "cpu=4,mem=8G,node=1,gres/gpu=2,gres/gpu:a100=2", "tres_per_node": "gres/gpu:a100:2", "memory_per_node": 8192, "state_reason": "Resources", "submit_time": 1100, "account": "research", "qos": "normal"},
+ {"job_id": 103, "name": "other", "user_name": "bob", "partition": "shared", "job_state": ["RUNNING"], "node_count": 1, "cpus": 4, "tres_alloc_str": "cpu=4,gres/gpu=2,gres/gpu:v100=2", "submit_time": 1200}
+]}

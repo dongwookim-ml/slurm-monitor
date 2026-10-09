@@ -1,64 +1,19 @@
-# CLAUDE.md
+# Repository guide
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+SLURM Monitor is a read-only CLI. Keep `slurm_monitor.py` standalone so direct execution and copying it to `~/bin/slurm-monitor` continue to work. Python 3.8 compatibility uses postponed annotations. Package metadata belongs only in `pyproject.toml`.
 
-## Project Overview
+The module separates normalized job/node models, parsers, a snapshot collector, resource assessment, job tracking, a durable Slack outbox, a delivery worker and pure Rich rendering. Do not query SLURM from renderers. Missing fields stay unknown. Queue failures never become empty successful snapshots. Job disappearance requires accounting confirmation, including Submit identity when known. GPU figures are SLURM allocations, never CPU-based estimates.
 
-SLURM Monitor is a single-file Python CLI tool that provides real-time terminal dashboards for monitoring SLURM cluster jobs and GPU availability. It uses the Rich library for terminal UI rendering.
-
-## Commands
+Safe local checks:
 
 ```bash
-# Install in development mode
-pip install -e .
-
-# Run directly
-python slurm_monitor.py --once        # Single snapshot
-python slurm_monitor.py               # Live dashboard
-python slurm_monitor.py -c            # Compact view
-python slurm_monitor.py -a            # All users
-python slurm_monitor.py -s            # With Slack notifications
-python slurm_monitor.py -p <partition> # Partition detail view (per-node GPUs/CPUs)
-
-# Install to ~/bin for personal use
-cp slurm_monitor.py ~/bin/slurm-monitor && chmod +x ~/bin/slurm-monitor
+python -m pytest
+ruff check .
+ruff format --check .
+python -m build
+python slurm_monitor.py --help
 ```
 
-## Architecture
+The regression suite prohibits real subprocesses and HTTP. Fixtures are synthetic and contain no credentials. Test interrupted/restarted and failed/retried delivery flows when changing tracking or persistence. Keep diagnostic text literal; do not interpret job names as Rich or Slack markup. State files contain job data and event queues, never webhook URLs.
 
-The entire application is in `slurm_monitor.py` (~840 lines), organized into sections:
-
-1. **Slack Notification Support** (lines 32-214)
-   - `load_env_file()` - Loads webhook URL from `.env` or `~/.slurm-monitor.env`
-   - `send_slack_notification()` - HTTP POST to Slack webhook
-   - `JobTracker` class - Tracks job state changes between polling cycles, batches multiple events into single notifications
-
-2. **SLURM Commands** (lines 216-427)
-   - `run_command()` - Subprocess wrapper for shell commands
-   - `get_jobs()` - Parses `squeue` output into job dicts
-   - `get_cluster_summary()` - Parses `sinfo` for cluster stats
-   - `get_gpu_availability()` - Parses GPU info per partition
-   - `get_partition_nodes()` - Parses per-node GPU/CPU info for a specific partition
-
-3. **UI Components** (lines 429-763)
-   - `create_summary_table()` - Per-partition running/pending/GPU counts
-   - `create_job_table()` - Running or pending jobs table
-   - `create_gpu_table()` - GPU availability with usage bars
-   - `create_partition_detail_table()` - Per-node GPU/CPU availability table
-   - `create_dashboard()` - Full Rich Layout with all components
-   - `create_compact_view()` - Single table view
-   - `create_partition_view()` - Partition detail view layout
-
-4. **Main Loop** (lines 766-841)
-   - Argument parsing, Rich Live display loop, Slack integration
-
-## Key Patterns
-
-- Jobs are represented as dicts with keys: `id`, `name`, `user`, `partition`, `state`, `time`, `time_limit`, `nodes`, `reason`, `gres`
-- GPU counts are parsed from GRES strings like `gpu:4` or `gpu:A100:4`
-- JobTracker maintains `previous_jobs` dict to detect state transitions (PENDING→RUNNING, RUNNING→gone)
-- Slack notifications are batched per polling cycle and grouped by event type
-
-## Slack Webhook Configuration
-
-Webhook URL is loaded from (in order): `./.env`, `~/.slurm-monitor.env`, or `--slack-webhook` flag.
+Do not use a production cluster, send real Slack messages, submit/cancel jobs, publish packages, push or create PRs without explicit authorization. Offline test success does not establish compatibility with a site's SLURM schema, PrivateData settings or accounting setup.

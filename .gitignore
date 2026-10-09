@@ -40,3 +40,10 @@ Thumbs.db
 # Environment files with secrets
 .env
 *.env.local
+
+# Local verification and private delivery state
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.state.json
+*.state.json.lock

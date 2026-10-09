@@ -1,917 +1,1797 @@
 #!/usr/bin/env python3
-"""
-SLURM Job Monitor - Real-time terminal visualization for SLURM jobs
-Usage: slurm-monitor [--interval SECONDS] [--all-users]
-"""
+"""Read-only SLURM dashboard. Collection, tracking, delivery and rendering are separate."""
 
-import subprocess
+from __future__ import annotations
+
 import argparse
-import time
-import os
-import sys
+import fcntl
+import getpass
+import hashlib
 import json
-import urllib.request
+import math
+import os
+import re
+import shlex
+import socket
+import subprocess
+import tempfile
+import threading
+import time
 import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, Optional
 
-try:
-    from rich.console import Console
-    from rich.table import Table
-    from rich.live import Live
-    from rich.panel import Panel
-    from rich.layout import Layout
-    from rich.text import Text
-    from rich import box
-except ImportError:
-    print("Error: 'rich' library not installed.")
-    print("Install it with: pip install rich")
-    sys.exit(1)
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+VERSION = "0.2.0"
+TERMINAL = {
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+    "TIMEOUT",
+    "OUT_OF_MEMORY",
+    "NODE_FAIL",
+    "BOOT_FAIL",
+    "PREEMPTED",
+    "DEADLINE",
+    "REVOKED",
+}
+UNUSABLE = {
+    "DOWN",
+    "DRAIN",
+    "DRAINED",
+    "DRAINING",
+    "FAIL",
+    "FAILING",
+    "MAINT",
+    "FUTURE",
+    "UNKNOWN",
+    "NOT_RESPONDING",
+    "POWERED_DOWN",
+    "POWERING_DOWN",
+    "POWER_DOWN",
+    "REBOOT_ISSUED",
+    "REBOOT_REQUESTED",
+    "PLANNED",
+    "RESERVED",
+}
+SEP = "\x1f"
+QUEUE_FIELDS = [
+    "JobArrayID",
+    "Name",
+    "UserName",
+    "Partition",
+    "State",
+    "TimeUsed",
+    "TimeLimit",
+    "NumNodes",
+    "Reason",
+    "tres-alloc",
+    "tres-per-node",
+    "NumCPUs",
+    "MinMemory",
+    "Feature",
+    "QOS",
+    "Account",
+    "Reservation",
+    "SubmitTime",
+    "tres-per-task",
+]
 
 
-# =============================================================================
-# Slack Notification Support
-# =============================================================================
-
-def load_env_file() -> dict:
-    """Load environment variables from .env file."""
-    env_vars = {}
-    env_paths = [
-        Path.cwd() / '.env',
-        Path.home() / '.slurm-monitor.env',
-        Path(__file__).parent / '.env',
-    ]
-
-    for env_path in env_paths:
-        if env_path.exists():
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        key, value = line.split('=', 1)
-                        env_vars[key.strip()] = value.strip()
-            break
-    return env_vars
+class QueryError(RuntimeError):
+    """A failed query or malformed response, never an empty successful snapshot."""
 
 
-def send_slack_notification(webhook_url: str, message: str, emoji: str = ":computer:") -> bool:
-    """Send a notification to Slack via webhook."""
-    if not webhook_url:
-        return False
+class StateError(RuntimeError):
+    """Local delivery journal cannot be safely used."""
 
-    payload = {
-        "text": message,
-        "icon_emoji": emoji,
-        "username": "SLURM Monitor"
-    }
 
+def clean(value: object, limit: int = 500) -> str:
+    """Strip terminal/control sequences and redact webhook URLs in diagnostics."""
+    text = str(value if value is not None else "")
+    text = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", text)
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text)
+    text = re.sub(r"[\u202a-\u202e\u2066-\u2069]", "", text)
+    text = re.sub(r"https?://hooks\.slack(?:-gov)?\.com/\S+", "[webhook redacted]", text)
+    return text[:limit]
+
+
+def literal(value: object, style: str = "") -> Text:
+    return Text(clean(value), style=style)
+
+
+def number(value: object) -> Optional[int]:
+    if isinstance(value, dict):
+        if value.get("set") is False or value.get("infinite") is True:
+            return None
+        value = value.get("number")
+    if value is None or isinstance(value, bool):
+        return None
     try:
-        data = json.dumps(payload).encode('utf-8')
-        req = urllib.request.Request(
-            webhook_url,
-            data=data,
-            headers={'Content-Type': 'application/json'}
+        result = int(value)
+    except (ValueError, TypeError):
+        return None
+    return result if 0 <= result < 0xFFFFFFFE else None
+
+
+def state_name(value: object) -> str:
+    if isinstance(value, list):
+        # COMPLETING is a flag in several JSON schema versions.
+        values = [str(v).upper() for v in value]
+        if "COMPLETING" in values:
+            return "COMPLETING"
+        value = values[0] if values else "UNKNOWN"
+    return str(value or "UNKNOWN").upper().split()[0].rstrip("+")
+
+
+def submitted_token(value: object) -> str:
+    numeric = number(value)
+    if numeric is not None:
+        return str(numeric)
+    try:
+        return str(int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()))
+    except (ValueError, TypeError, OverflowError):
+        return ""
+
+
+def duration(value: object) -> Optional[float]:
+    text = str(value or "").strip()
+    if text.upper() in {"UNLIMITED", "INFINITE"}:
+        return math.inf
+    try:
+        days, _, clock = text.rpartition("-")
+        pieces = [int(v) for v in (clock if days else text).split(":")]
+        if len(pieces) == 3:
+            seconds = pieces[0] * 3600 + pieces[1] * 60 + pieces[2]
+        elif len(pieces) == 2:
+            seconds = pieces[0] * 60 + pieces[1]
+        elif len(pieces) == 1:
+            seconds = pieces[0] * 60  # SLURM bare limits are minutes.
+        else:
+            return None
+        return seconds + (int(days) * 86400 if days else 0)
+    except ValueError:
+        return None
+
+
+def memory_mib(value: object) -> Optional[int]:
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([KMGT]?)(?:[cn])?", str(value).strip(), re.I)
+    if not match:
+        return None
+    return int(
+        float(match[1]) * {"": 1, "K": 1 / 1024, "M": 1, "G": 1024, "T": 1024**2}[match[2].upper()]
+    )
+
+
+@dataclass
+class GPUCount:
+    total: Optional[int] = None
+    types: dict[str, int] = field(default_factory=dict)
+
+
+def parse_gpus(value: object, empty_is_zero: bool = False) -> GPUCount:
+    """Read GRES and TRES, preserving types and avoiding generic+typed TRES double counts."""
+    text = re.sub(r"\([^)]*\)", "", str(value or ""))
+    if text.strip() in {"", "(null)", "None", "N/A", "Unknown"}:
+        return GPUCount(0 if empty_is_zero else None)
+    counts: dict[str, int] = {}
+    for token in text.split(","):
+        match = re.fullmatch(r"(?:gres/)?gpu(?::([^:=]+))?[:=](\d+)", token.strip(), re.I)
+        if match:
+            key = (match[1] or "").lower()
+            counts[key] = counts.get(key, 0) + int(match[2])
+        elif re.match(r"(?:gres/)?gpu(?:[:=]|$)", token.strip(), re.I):
+            return GPUCount()  # Do not silently ignore a malformed GPU resource.
+    if not counts:
+        return GPUCount(0)
+    total = counts[""] if "=" in text and "" in counts else sum(counts.values())
+    return GPUCount(total, {k: v for k, v in counts.items() if k})
+
+
+def tres_value(value: object, key: str) -> str:
+    for token in str(value or "").split(","):
+        if token.startswith(key + "="):
+            return token.split("=", 1)[1]
+    return ""
+
+
+@dataclass
+class Job:
+    id: str
+    name: str = ""
+    user: str = ""
+    partition: str = ""
+    state: str = "UNKNOWN"
+    runtime: str = ""
+    time_limit: str = ""
+    nodes: Optional[int] = None
+    gpus: Optional[int] = None
+    gpu_types: dict[str, int] = field(default_factory=dict)
+    requested_gpus: Optional[int] = None
+    requested_types: dict[str, int] = field(default_factory=dict)
+    gpu_per_node: dict[str, int] = field(default_factory=dict)
+    cpus: Optional[int] = None
+    memory_per_node: Optional[int] = None
+    features: str = ""
+    qos: str = ""
+    account: str = ""
+    reservation: str = ""
+    reason: str = ""
+    submitted: str = ""
+    restart_count: int = 0
+    exit_code: str = ""
+    derived_exit_code: str = ""
+    task_resources: str = ""
+    memory_total: Optional[int] = None
+
+    @property
+    def terminal(self) -> bool:
+        return self.state in TERMINAL
+
+
+@dataclass
+class Node:
+    name: str
+    partitions: list[str] = field(default_factory=list)
+    states: list[str] = field(default_factory=list)
+    gpus: Optional[int] = None
+    gpu_types: dict[str, int] = field(default_factory=dict)
+    used_gpus: Optional[int] = None
+    used_types: dict[str, int] = field(default_factory=dict)
+    cpus: Optional[int] = None
+    used_cpus: Optional[int] = None
+    memory: Optional[int] = None
+    used_memory: Optional[int] = None
+    features: list[str] = field(default_factory=list)
+    drained_gpus: Optional[int] = 0
+    drained_types: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def usable(self) -> bool:
+        return bool(
+            {"IDLE", "MIXED", "ALLOCATED", "COMPLETING"}.intersection(self.states)
+        ) and not UNUSABLE.intersection(self.states)
+
+    @property
+    def free_gpus(self) -> Optional[int]:
+        if not self.usable:
+            return 0
+        if (
+            self.gpus is None
+            or self.used_gpus is None
+            or self.drained_gpus is None
+            or self.used_gpus + self.drained_gpus > self.gpus
+        ):
+            return None
+        return self.gpus - self.used_gpus - self.drained_gpus
+
+    def free_type(self, kind: str) -> Optional[int]:
+        if not self.usable:
+            return 0
+        if self.free_gpus is None:
+            return None
+        if len(self.gpu_types) == 1:
+            return self.free_gpus if kind in self.gpu_types else 0
+        if (
+            sum(self.used_types.values()) != self.used_gpus
+            or sum(self.drained_types.values()) != self.drained_gpus
+        ):
+            return None
+        return max(
+            0,
+            self.gpu_types.get(kind, 0)
+            - self.used_types.get(kind, 0)
+            - self.drained_types.get(kind, 0),
         )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return response.status == 200
-    except (urllib.error.URLError, urllib.error.HTTPError) as e:
-        return False
 
 
-def format_job_notification(job: dict, event: str) -> tuple[str, str]:
-    """Format a job event notification message and emoji."""
-    job_id = job.get('id', 'unknown')
-    job_name = job.get('name', 'unknown')
-    partition = job.get('partition', 'unknown')
-    runtime = job.get('time', 'unknown')
-    gpus = job.get('gres', '').replace('gpu:', '') or '0'
-
-    if event == 'completed':
-        emoji = ":white_check_mark:"
-        message = f"*Job Completed*\n" \
-                  f"• ID: `{job_id}`\n" \
-                  f"• Name: *{job_name}*\n" \
-                  f"• Partition: {partition}\n" \
-                  f"• GPUs: {gpus}\n" \
-                  f"• Runtime: {runtime}"
-    elif event == 'failed':
-        emoji = ":x:"
-        message = f"*Job Failed*\n" \
-                  f"• ID: `{job_id}`\n" \
-                  f"• Name: *{job_name}*\n" \
-                  f"• Partition: {partition}\n" \
-                  f"• GPUs: {gpus}\n" \
-                  f"• Runtime: {runtime}"
-    elif event == 'started':
-        emoji = ":rocket:"
-        message = f"*Job Started*\n" \
-                  f"• ID: `{job_id}`\n" \
-                  f"• Name: *{job_name}*\n" \
-                  f"• Partition: {partition}\n" \
-                  f"• GPUs: {gpus}"
-    else:
-        emoji = ":information_source:"
-        message = f"*Job Update*: {job_id} - {job_name} ({event})"
-
-    return message, emoji
+@dataclass
+class Partition:
+    name: str
+    state: str = "UNKNOWN"
+    max_time: str = ""
+    max_nodes: Optional[int] = None
+    accounts: str = ""
+    qos: str = ""
+    groups: str = ""
 
 
-class JobTracker:
-    """Track job state changes for notifications."""
-
-    def __init__(self, webhook_url: str = None, console: Console = None):
-        self.webhook_url = webhook_url
-        self.console = console or Console()
-        self.previous_jobs: dict[str, dict] = {}  # job_id -> job_info
-        self.notified_starts: set[str] = set()  # Track jobs we've notified about starting
-
-    def update(self, current_jobs: list[dict]) -> list[tuple[dict, str]]:
-        """Update job tracking and return list of (job, event) tuples."""
-        events = []
-        current_job_ids = {job['id'] for job in current_jobs}
-        current_jobs_map = {job['id']: job for job in current_jobs}
-
-        # Check for completed/failed jobs (were running, now gone)
-        for job_id, job_info in self.previous_jobs.items():
-            if job_id not in current_job_ids:
-                if job_info['state'] == 'RUNNING':
-                    # Job finished - assume completed (SLURM doesn't tell us exit status via squeue)
-                    events.append((job_info, 'completed'))
-
-        # Check for newly started jobs (were pending, now running)
-        for job_id, job_info in current_jobs_map.items():
-            if job_info['state'] == 'RUNNING' and job_id not in self.notified_starts:
-                prev_job = self.previous_jobs.get(job_id)
-                if prev_job is None or prev_job['state'] == 'PENDING':
-                    events.append((job_info, 'started'))
-                    self.notified_starts.add(job_id)
-
-        # Update previous jobs
-        self.previous_jobs = current_jobs_map.copy()
-
-        # Clean up notified_starts for jobs that no longer exist
-        self.notified_starts = self.notified_starts & current_job_ids
-
-        # Send merged notification if there are events
-        if events:
-            self._notify_batch(events)
-
-        return events
-
-    def _notify_batch(self, events: list[tuple[dict, str]]):
-        """Send a single merged notification for multiple job events."""
-        if not self.webhook_url or not events:
-            return
-
-        # Group events by type
-        started = [job for job, event in events if event == 'started']
-        completed = [job for job, event in events if event == 'completed']
-
-        # Build merged message
-        sections = []
-
-        if started:
-            if len(started) == 1:
-                job = started[0]
-                gpus = job.get('gres', '').replace('gpu:', '') or '0'
-                sections.append(
-                    f":rocket: *Job Started*\n"
-                    f"• `{job['id']}` *{job['name']}* ({job['partition']}, {gpus} GPUs)"
-                )
-            else:
-                lines = [f":rocket: *{len(started)} Jobs Started*"]
-                for job in started:
-                    gpus = job.get('gres', '').replace('gpu:', '') or '0'
-                    lines.append(f"• `{job['id']}` *{job['name']}* ({job['partition']}, {gpus} GPUs)")
-                sections.append("\n".join(lines))
-
-        if completed:
-            if len(completed) == 1:
-                job = completed[0]
-                gpus = job.get('gres', '').replace('gpu:', '') or '0'
-                sections.append(
-                    f":white_check_mark: *Job Completed*\n"
-                    f"• `{job['id']}` *{job['name']}* ({job['partition']}, {gpus} GPUs, {job.get('time', '?')})"
-                )
-            else:
-                lines = [f":white_check_mark: *{len(completed)} Jobs Completed*"]
-                for job in completed:
-                    gpus = job.get('gres', '').replace('gpu:', '') or '0'
-                    lines.append(f"• `{job['id']}` *{job['name']}* ({job['partition']}, {gpus} GPUs, {job.get('time', '?')})")
-                sections.append("\n".join(lines))
-
-        message = "\n\n".join(sections)
-        emoji = ":rocket:" if started and not completed else ":white_check_mark:" if completed else ":computer:"
-
-        success = send_slack_notification(self.webhook_url, message, emoji)
-        if success:
-            event_summary = []
-            if started:
-                event_summary.append(f"{len(started)} started")
-            if completed:
-                event_summary.append(f"{len(completed)} completed")
-            self.console.print(f"[dim]Slack notification sent: {', '.join(event_summary)}[/]")
+@dataclass
+class Snapshot:
+    jobs: list[Job] = field(default_factory=list)
+    nodes: list[Node] = field(default_factory=list)
+    partitions: list[Partition] = field(default_factory=list)
+    accounting: list[Job] = field(default_factory=list)
+    jobs_ok: bool = True
+    nodes_ok: bool = True
+    errors: list[str] = field(default_factory=list)
+    collected_at: float = 0
+    jobs_at: float = 0
+    nodes_at: float = 0
+    partitions_at: float = 0
 
 
-# =============================================================================
-# SLURM Commands
-# =============================================================================
-
-def run_command(cmd: str) -> str:
-    """Run a shell command and return output."""
+def run_command(argv: list[str], timeout: float = 15) -> str:
+    """Run only an argv list. Hide stderr (which can contain URLs/job secrets)."""
+    if isinstance(argv, str):
+        raise TypeError("Commands must be argv lists")
+    environment = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("SQUEUE_", "SINFO_", "SACCT_"))
+        and k not in {"SLURM_CLUSTERS", "SLURM_JSON", "SLURM_YAML"}
+    }
+    environment["LC_ALL"] = "C"
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-        return result.stdout.strip()
-    except Exception as e:
-        return f"Error: {e}"
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout, check=False, env=environment
+        )
+    except FileNotFoundError:
+        raise QueryError(f"{Path(argv[0]).name}: command not found") from None
+    except (subprocess.TimeoutExpired, OSError, UnicodeError):
+        raise QueryError(f"{Path(argv[0]).name}: query timed out or could not execute") from None
+    if result.returncode:
+        # Only retain the capability signal internally, never raw output in diagnostics.
+        unsupported = any(
+            v in result.stderr.lower()
+            for v in ("unrecognized option", "unknown option", "data_parser", "invalid option")
+        )
+        raise QueryError(
+            f"{Path(argv[0]).name}: {'unsupported format' if unsupported else 'query failed'} (exit {result.returncode})"
+        )
+    return result.stdout
 
 
-def get_jobs(user: str = None) -> list[dict]:
-    """Get SLURM jobs with detailed information."""
-    user_filter = "" if user is None else f"-u {user}"
-    cmd = f"squeue {user_filter} -o '%i|%j|%u|%P|%T|%M|%l|%D|%R|%b' --noheader"
-    output = run_command(cmd)
+def parse_queue_json(output: str) -> list[Job]:
+    try:
+        payload = json.loads(output)
+        if (
+            not isinstance(payload, dict)
+            or payload.get("errors")
+            or not isinstance(payload.get("jobs"), list)
+        ):
+            raise ValueError("Missing jobs or server errors")
+        jobs = []
+        for row in payload["jobs"]:
+            jid = number(row.get("job_id"))
+            if jid is None or not row.get("job_state"):
+                raise ValueError("Missing job identifier/state")
+            identifier = str(jid)
+            array = number(row.get("array_job_id"))
+            task = number(row.get("array_task_id"))
+            if array:
+                if task is None:
+                    raise QueryError(
+                        "squeue: unsupported format for grouped arrays; using expanded text"
+                    )
+                identifier = f"{array}_{task}"
+            heterogeneous = number(row.get("het_job_id"))
+            if heterogeneous:
+                identifier = f"{heterogeneous}+{number(row.get('het_job_offset')) or 0}"
+            state = state_name(row["job_state"])
+            allocated = parse_gpus(row.get("tres_alloc_str"))
+            requested = parse_gpus(
+                row.get("tres_req_str") or (row.get("tres_alloc_str") if state == "PENDING" else "")
+            )
+            per_node = parse_gpus(row.get("tres_per_node"))
+            node_requirements = dict(per_node.types)
+            if per_node.total:
+                node_requirements[""] = per_node.total
+            requested_nodes = number(row.get("node_count") or row.get("minimum_nodes"))
+            if (
+                requested.total is None
+                and per_node.total is not None
+                and requested_nodes is not None
+            ):
+                requested = GPUCount(
+                    per_node.total * requested_nodes,
+                    {key: value * requested_nodes for key, value in per_node.types.items()},
+                )
+            limit = number(row.get("time_limit"))
+            start, end = number(row.get("start_time")), number(row.get("end_time"))
+            elapsed = max(0, (end or int(time.time())) - start) if start else None
+            jobs.append(
+                Job(
+                    identifier,
+                    str(row.get("name") or ""),
+                    str(row.get("user_name") or ""),
+                    str(row.get("partition") or ""),
+                    state,
+                    str(elapsed) + "s" if elapsed is not None else "",
+                    str(limit) if limit is not None else "",
+                    requested_nodes,
+                    allocated.total if state != "PENDING" else None,
+                    allocated.types,
+                    requested.total,
+                    requested.types,
+                    node_requirements,
+                    number(row.get("cpus") or row.get("minimum_cpus")),
+                    number(row.get("memory_per_node") or row.get("minimum_memory_per_node")),
+                    str(row.get("features") or ""),
+                    str(row.get("qos") or ""),
+                    str(row.get("account") or ""),
+                    str(row.get("reservation") or ""),
+                    str(row.get("state_reason") or ""),
+                    submitted_token(row.get("submit_time")),
+                    number(row.get("restart_cnt")) or 0,
+                    task_resources=str(row.get("tres_per_task") or ""),
+                    memory_total=memory_mib(tres_value(row.get("tres_req_str"), "mem")),
+                )
+            )
+        return jobs
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise QueryError("squeue: malformed JSON response; previous jobs retained") from None
 
+
+def parse_queue_text(output: str) -> list[Job]:
     jobs = []
-    if output and not output.startswith("Error"):
-        for line in output.split('\n'):
-            if line.strip():
-                parts = line.split('|')
-                if len(parts) >= 10:
-                    jobs.append({
-                        'id': parts[0].strip(),
-                        'name': parts[1].strip()[:30],
-                        'user': parts[2].strip(),
-                        'partition': parts[3].strip(),
-                        'state': parts[4].strip(),
-                        'time': parts[5].strip(),
-                        'time_limit': parts[6].strip(),
-                        'nodes': parts[7].strip(),
-                        'reason': parts[8].strip()[:25],
-                        'gres': parts[9].strip(),
-                    })
+    for line in output.split("\n"):
+        if not line.strip():
+            continue
+        columns = [v.strip() for v in line.split(SEP)]
+        if len(columns) != len(QUEUE_FIELDS) or not re.fullmatch(
+            r"\d+(?:[_+][\d\[\],%?-]+)?", columns[0]
+        ):
+            raise QueryError("squeue: malformed text response; previous jobs retained")
+        (
+            identifier,
+            name,
+            user,
+            partition,
+            state,
+            runtime,
+            limit,
+            nodes,
+            reason,
+            alloc,
+            per_node,
+            cpus,
+            mem,
+            features,
+            qos,
+            account,
+            reservation,
+            submit,
+            task,
+        ) = columns
+        allocation, per = parse_gpus(alloc), parse_gpus(per_node)
+        types = dict(per.types)
+        if per.total:
+            types[""] = per.total
+        # MinMemory's CPU/node scope varies with submission mode; do not invent a scope.
+        jobs.append(
+            Job(
+                identifier,
+                name,
+                user,
+                partition,
+                state_name(state),
+                runtime,
+                limit,
+                number(nodes),
+                allocation.total if state != "PENDING" else None,
+                allocation.types,
+                allocation.total if state == "PENDING" else None,
+                allocation.types,
+                types,
+                number(cpus),
+                features=features,
+                qos=qos,
+                account=account,
+                reservation=reservation,
+                reason=reason,
+                submitted=submitted_token(submit),
+                task_resources=task,
+            )
+        )
     return jobs
 
 
-def get_cluster_summary() -> dict:
-    """Get cluster resource summary."""
-    # Get partition info
-    cmd = "sinfo -o '%P|%a|%D|%C' --noheader"
-    output = run_command(cmd)
-
-    partitions = []
-    total_nodes = 0
-    total_cpus_alloc = 0
-    total_cpus = 0
-
-    if output and not output.startswith("Error"):
-        for line in output.split('\n'):
-            if line.strip():
-                parts = line.split('|')
-                if len(parts) >= 4:
-                    name = parts[0].strip().rstrip('*')
-                    state = parts[1].strip()
-                    nodes = parts[2].strip()
-                    # CPU format: allocated/idle/other/total
-                    cpu_info = parts[3].strip().split('/')
-                    if len(cpu_info) == 4:
-                        alloc, idle, other, total = map(int, cpu_info)
-                        total_cpus_alloc += alloc
-                        total_cpus += total
-                    total_nodes += int(nodes) if nodes.isdigit() else 0
-                    partitions.append({
-                        'name': name,
-                        'state': state,
-                        'nodes': nodes,
-                        'cpus': parts[3].strip()
-                    })
-
-    # Get GPU usage
-    cmd = "squeue -t RUNNING -o '%b' --noheader | grep gpu | sed 's/.*gpu://' | sed 's/,.*//' | sed 's/.*://' | awk '{s+=$1} END {print s}'"
-    gpus_in_use = run_command(cmd)
-    gpus_in_use = int(gpus_in_use) if gpus_in_use.isdigit() else 0
-
+def key_values(line: str) -> dict[str, str]:
+    matches = list(re.finditer(r"(?:^|\s)([A-Za-z][A-Za-z0-9_]*)=", line))
+    if len({match[1] for match in matches}) != len(matches):
+        raise QueryError("scontrol: ambiguous duplicate fields")
     return {
-        'partitions': partitions,
-        'total_nodes': total_nodes,
-        'cpus_alloc': total_cpus_alloc,
-        'cpus_total': total_cpus,
-        'gpus_in_use': gpus_in_use
+        m[1]: line[m.end() : matches[i + 1].start() if i + 1 < len(matches) else len(line)].strip()
+        for i, m in enumerate(matches)
     }
 
 
-def get_gpu_availability() -> list[dict]:
-    """Get GPU availability per partition."""
-    # Get total GPUs per partition from sinfo
-    cmd = "sinfo -o '%P|%G|%D|%t|%C' --noheader"
-    output = run_command(cmd)
-
-    partitions = {}
-    if output and not output.startswith("Error"):
-        for line in output.split('\n'):
-            if line.strip():
-                parts = line.split('|')
-                if len(parts) >= 5:
-                    name = parts[0].strip().rstrip('*')
-                    gres = parts[1].strip()
-                    nodes = int(parts[2].strip()) if parts[2].strip().isdigit() else 0
-
-                    # Parse GPU info
-                    gpu_count = 0
-                    gpu_type = ""
-                    if 'gpu:' in gres:
-                        gpu_part = gres.split('gpu:')[1].split(',')[0].split('(')[0]
-                        if ':' in gpu_part:
-                            gpu_type, gpu_count = gpu_part.rsplit(':', 1)
-                            gpu_count = int(gpu_count) if gpu_count.isdigit() else 0
-                        else:
-                            gpu_count = int(gpu_part) if gpu_part.isdigit() else 0
-
-                    if name not in partitions:
-                        partitions[name] = {'total': 0, 'idle': 0, 'gpu_type': gpu_type}
-
-                    partitions[name]['total'] += nodes * gpu_count
-
-    # Get per-partition GPU usage from running jobs via squeue
-    cmd = "squeue -t RUNNING -o '%P|%b|%D' --noheader"
-    output = run_command(cmd)
-
-    gpu_in_use = {}
-    if output and not output.startswith("Error"):
-        for line in output.split('\n'):
-            if line.strip():
-                parts = line.split('|')
-                if len(parts) >= 3:
-                    partition = parts[0].strip()
-                    gres = parts[1].strip()
-                    job_nodes = int(parts[2].strip()) if parts[2].strip().isdigit() else 1
-                    if 'gpu:' in gres:
-                        gpu_str = gres.split('gpu:')[1].split(',')[0].split('(')[0]
-                        if ':' in gpu_str:
-                            count_str = gpu_str.split(':')[-1]
-                        else:
-                            count_str = gpu_str
-                        try:
-                            gpu_in_use[partition] = gpu_in_use.get(partition, 0) + int(count_str) * job_nodes
-                        except ValueError:
-                            pass
-
-    # Available = total - in_use
-    for name, info in partitions.items():
-        used = gpu_in_use.get(name, 0)
-        info['idle'] = max(0, info['total'] - used)
-
-    return [{'name': k, **v} for k, v in partitions.items()]
-
-
-def get_partition_nodes(partition: str) -> list[dict]:
-    """Get per-node GPU and CPU availability for a specific partition."""
-    cmd = f"sinfo -N -p {partition} -o '%N|%t|%C|%G' --noheader"
-    output = run_command(cmd)
-
-    nodes = []
-    if output and not output.startswith("Error"):
-        for line in output.split('\n'):
-            if line.strip():
-                parts = line.split('|')
-                if len(parts) >= 4:
-                    name = parts[0].strip()
-                    state = parts[1].strip()
-                    cpu_info = parts[2].strip()
-                    gres = parts[3].strip()
-
-                    # Parse CPU info: allocated/idle/other/total
-                    cpus_alloc, cpus_idle, cpus_other, cpus_total = 0, 0, 0, 0
-                    if '/' in cpu_info:
-                        cpu_parts = cpu_info.split('/')
-                        if len(cpu_parts) == 4:
-                            cpus_alloc = int(cpu_parts[0]) if cpu_parts[0].isdigit() else 0
-                            cpus_idle = int(cpu_parts[1]) if cpu_parts[1].isdigit() else 0
-                            cpus_other = int(cpu_parts[2]) if cpu_parts[2].isdigit() else 0
-                            cpus_total = int(cpu_parts[3]) if cpu_parts[3].isdigit() else 0
-
-                    # Parse GPU info from GRES
-                    gpus_total = 0
-                    gpu_type = ""
-                    if 'gpu:' in gres:
-                        gpu_part = gres.split('gpu:')[1].split(',')[0].split('(')[0]
-                        if ':' in gpu_part:
-                            gpu_type, gpu_count_str = gpu_part.rsplit(':', 1)
-                            gpus_total = int(gpu_count_str) if gpu_count_str.isdigit() else 0
-                        else:
-                            gpus_total = int(gpu_part) if gpu_part.isdigit() else 0
-
-                    # Calculate available GPUs based on state
-                    if state == 'idle':
-                        gpus_avail = gpus_total
-                    elif state == 'mix':
-                        # For mix state, estimate based on CPU usage ratio
-                        if cpus_total > 0:
-                            usage_ratio = cpus_alloc / cpus_total
-                            gpus_avail = max(0, int(gpus_total * (1 - usage_ratio)))
-                        else:
-                            gpus_avail = gpus_total // 2
-                    else:  # alloc, down, drain, etc.
-                        gpus_avail = 0
-
-                    nodes.append({
-                        'name': name,
-                        'state': state,
-                        'cpus_alloc': cpus_alloc,
-                        'cpus_total': cpus_total,
-                        'gpus_avail': gpus_avail,
-                        'gpus_total': gpus_total,
-                        'gpu_type': gpu_type
-                    })
-
-    return sorted(nodes, key=lambda x: x['name'])
-
-
-def get_partition_summary(jobs: list[dict]) -> list[dict]:
-    """Get summary of running and pending jobs per partition."""
-    summary = {}
-    for job in jobs:
-        partition = job['partition']
-        state = job['state']
-
-        if partition not in summary:
-            summary[partition] = {'running': 0, 'pending': 0, 'gpus': 0}
-
-        if state == 'RUNNING':
-            summary[partition]['running'] += 1
-            # Parse GPU count from gres
-            gres = job['gres']
-            if 'gpu:' in gres:
-                gpu_str = gres.split('gpu:')[1].split(',')[0].split('(')[0]
-                # Handle formats like "gpu:4" or "gpu:A100:4"
-                if ':' in gpu_str:
-                    gpu_count = gpu_str.split(':')[-1]
-                else:
-                    gpu_count = gpu_str
-                try:
-                    summary[partition]['gpus'] += int(gpu_count)
-                except ValueError:
-                    pass
-        elif state == 'PENDING':
-            summary[partition]['pending'] += 1
-
-    return [{'partition': k, **v} for k, v in sorted(summary.items())]
-
-
-def create_summary_table(jobs: list[dict]) -> Table:
-    """Create a summary table showing running/pending jobs and GPUs per partition."""
-    summary = get_partition_summary(jobs)
-
-    table = Table(
-        title="Summary",
-        box=box.ROUNDED,
-        header_style="bold cyan",
-        title_style="bold white",
-        expand=True
-    )
-
-    table.add_column("Partition", style="green", width=12)
-    table.add_column("Run", style="yellow", justify="right", width=5)
-    table.add_column("Pend", style="red", justify="right", width=5)
-    table.add_column("GPUs", style="magenta", justify="right", width=5)
-
-    total_running = 0
-    total_pending = 0
-    total_gpus = 0
-    for s in summary:
-        pend_str = str(s['pending']) if s['pending'] > 0 else "-"
-        table.add_row(s['partition'], str(s['running']), pend_str, str(s['gpus']))
-        total_running += s['running']
-        total_pending += s['pending']
-        total_gpus += s['gpus']
-
-    if summary:
-        table.add_section()
-        pend_total = str(total_pending) if total_pending > 0 else "-"
-        table.add_row("[bold]Total[/]", f"[bold]{total_running}[/]", f"[bold]{pend_total}[/]", f"[bold]{total_gpus}[/]")
-    else:
-        table.add_row("-", "0", "-", "0")
-
-    return table
-
-
-def create_job_table(jobs: list[dict], title: str, state_filter: str = None) -> Table:
-    """Create a rich table for jobs."""
-    filtered = [j for j in jobs if state_filter is None or j['state'] == state_filter]
-
-    table = Table(
-        title=title,
-        box=box.ROUNDED,
-        header_style="bold cyan",
-        title_style="bold white",
-        expand=True
-    )
-
-    table.add_column("ID", style="yellow", width=10)
-    table.add_column("Name", style="white", width=25)
-    table.add_column("User", style="blue", width=12)
-    table.add_column("Partition", style="green", width=12)
-    table.add_column("GPUs", style="magenta", width=8)
-    table.add_column("Time", style="cyan", width=12)
-    table.add_column("Limit", style="dim", width=12)
-
-    if state_filter == "PENDING":
-        table.add_column("Reason", style="red", width=20)
-
-    for job in filtered[:15]:  # Limit to 15 jobs per table
-        gpu_info = job['gres'].replace('gpu:', '') if 'gpu' in job['gres'] else '-'
-        row = [
-            job['id'],
-            job['name'],
-            job['user'],
-            job['partition'],
-            gpu_info,
-            job['time'],
-            job['time_limit'],
-        ]
-        if state_filter == "PENDING":
-            row.append(job['reason'])
-        table.add_row(*row)
-
-    if not filtered:
-        if state_filter == "PENDING":
-            table.add_row("-", "No pending jobs", "-", "-", "-", "-", "-", "-")
-        else:
-            table.add_row("-", "No running jobs", "-", "-", "-", "-", "-")
-
-    return table
-
-
-def get_user_gpu_usage(jobs: list[dict], username: str) -> dict:
-    """Compute per-partition GPU usage split by current user vs others.
-
-    Returns dict keyed by partition: {'my_gpus': int, 'others_gpus': int}
-    """
-    usage = {}
-    for job in jobs:
-        if job['state'] != 'RUNNING':
+def parse_nodes(output: str) -> list[Node]:
+    nodes: dict[str, Node] = {}
+    for line in output.splitlines():
+        if not line.strip():
             continue
-        partition = job['partition']
-        if partition not in usage:
-            usage[partition] = {'my_gpus': 0, 'others_gpus': 0}
+        row = key_values(line.split(" Reason=", 1)[0])
+        if not row.get("NodeName") or "State" not in row:
+            raise QueryError("scontrol: malformed node response; previous nodes retained")
+        configured = parse_gpus(row.get("Gres"), empty_is_zero="Gres" in row)
+        used = parse_gpus(
+            row.get("GresUsed", row.get("AllocTRES")),
+            empty_is_zero="GresUsed" in row or "AllocTRES" in row,
+        )
+        drained = parse_gpus(row.get("GresDrain"), empty_is_zero=True)
+        if configured.total == 0:
+            used = GPUCount(0)
+        states = [v.upper().rstrip("*~#%!$@^-") for v in row["State"].split("+")]
+        if "*" in row["State"]:
+            states.append("NOT_RESPONDING")
+        if re.search(r"[~#%!$@^]", row["State"]):
+            states.append("UNKNOWN")
+        node = Node(
+            row["NodeName"],
+            [v for v in row.get("Partitions", "").split(",") if v and v != "(null)"],
+            states,
+            configured.total,
+            configured.types,
+            used.total,
+            used.types,
+            number(row.get("CPUEfctv"))
+            if number(row.get("CPUEfctv")) is not None
+            else number(row.get("CPUTot")),
+            number(row.get("CPUAlloc")),
+            number(row.get("RealMemory")),
+            number(row.get("AllocMem")),
+            [v for v in row.get("ActiveFeatures", "").split(",") if v and v != "(null)"],
+            drained.total,
+            drained.types,
+        )
+        if node.name in nodes and nodes[node.name] != node:
+            raise QueryError("scontrol: conflicting duplicate node records")
+        nodes[node.name] = node
+    return list(nodes.values())
 
-        gpu_count = 0
-        gres = job['gres']
-        if 'gpu:' in gres:
-            gpu_str = gres.split('gpu:')[1].split(',')[0].split('(')[0]
-            if ':' in gpu_str:
-                gpu_count_str = gpu_str.split(':')[-1]
-            else:
-                gpu_count_str = gpu_str
+
+def parse_partitions(output: str) -> list[Partition]:
+    parts = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        row = key_values(line)
+        if not row.get("PartitionName"):
+            raise QueryError("scontrol: malformed partition response")
+        parts.append(
+            Partition(
+                row["PartitionName"],
+                row.get("State", "UNKNOWN").upper(),
+                row.get("MaxTime", ""),
+                number(row.get("MaxNodes")),
+                row.get("AllowAccounts", ""),
+                row.get("AllowQos", ""),
+                row.get("AllowGroups", ""),
+            )
+        )
+    return parts
+
+
+def parse_accounting(output: str) -> list[Job]:
+    jobs = []
+    # Names are deliberately absent: only non-free-text fields use the pipe delimiter.
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        columns = line.split("|")
+        if len(columns) != 9 or not re.fullmatch(r"\d+(?:[_+]\d+)?", columns[0]):
+            raise QueryError("sacct: malformed accounting response; endings remain unconfirmed")
+        jid, state, exit_code, derived, elapsed, allocated, partition, user, submitted = columns
+        if any(
+            value and value != "Unknown" and not re.fullmatch(r"\d+:\d+", value)
+            for value in (exit_code, derived)
+        ):
+            raise QueryError("sacct: malformed exit code; ending remains unconfirmed")
+        count = parse_gpus(allocated)
+        jobs.append(
+            Job(
+                jid,
+                user=user,
+                partition=partition,
+                state=state_name(state),
+                runtime=elapsed,
+                gpus=count.total,
+                gpu_types=count.types,
+                exit_code=exit_code,
+                derived_exit_code=derived,
+                submitted=submitted_token(submitted),
+            )
+        )
+    return jobs
+
+
+class Collector:
+    def __init__(
+        self,
+        runner: Callable[[list[str]], str] = run_command,
+        clock: Callable[[], float] = time.time,
+        partition_ttl: float = 60,
+    ):
+        self.run = runner
+        self.clock = clock
+        self.partition_ttl = partition_ttl
+        self.previous = Snapshot(jobs_ok=False, nodes_ok=False)
+        self.json_supported = True
+        self.partitions_attempted_at: Optional[float] = None
+        self.partition_error = ""
+        self.accounting_error = ""
+        self.accounting_cache: dict[str, list[Job]] = {}
+        self.accounting_attempts: dict[str, float] = {}
+        self.user: Optional[str] = None
+
+    def queue(self) -> list[Job]:
+        base = ["squeue", "--local", "--states=all", "--array"]
+        if self.user:
+            base += ["--user", self.user]
+        if self.json_supported:
             try:
-                gpu_count = int(gpu_count_str)
-            except ValueError:
-                pass
+                return parse_queue_json(self.run(base + ["--json"]))
+            except QueryError as error:
+                if "unsupported format" not in str(error):
+                    raise
+                self.json_supported = False
+        fmt = ",".join(
+            name + ":0" + (SEP if i + 1 < len(QUEUE_FIELDS) else "")
+            for i, name in enumerate(QUEUE_FIELDS)
+        )
+        return parse_queue_text(self.run(base + ["--noheader", "--Format", fmt]))
 
-        if job['user'] == username:
-            usage[partition]['my_gpus'] += gpu_count
-        else:
-            usage[partition]['others_gpus'] += gpu_count
+    def collect(
+        self, tracked: set[str] | dict[str, Job] = frozenset(), inspect_job: Optional[str] = None
+    ) -> Snapshot:
+        now = self.clock()
+        old = self.previous
+        result = Snapshot(
+            old.jobs,
+            old.nodes,
+            old.partitions,
+            collected_at=now,
+            jobs_at=old.jobs_at,
+            nodes_at=old.nodes_at,
+            partitions_at=old.partitions_at,
+        )
+        try:
+            result.jobs = self.queue()
+            result.jobs_at = now
+        except QueryError as error:
+            result.jobs_ok = False
+            result.errors.append(str(error))
+        try:
+            result.nodes = parse_nodes(self.run(["scontrol", "show", "nodes", "--oneliner"]))
+            result.nodes_at = now
+        except QueryError as error:
+            result.nodes_ok = False
+            result.errors.append(str(error))
+        if (
+            self.partitions_attempted_at is None
+            or now - self.partitions_attempted_at >= self.partition_ttl
+        ):
+            self.partitions_attempted_at = now
+            try:
+                result.partitions = parse_partitions(
+                    self.run(["scontrol", "show", "partitions", "--oneliner"])
+                )
+                result.partitions_at = now
+                self.partition_error = ""
+            except QueryError as error:
+                self.partition_error = str(error)
+        if self.partition_error:
+            result.errors.append(self.partition_error)
+        if result.jobs_ok:
+            current = {job.id for job in result.jobs if not job.terminal}
+            missing = set(tracked) - current
+            if isinstance(tracked, dict):
+                missing.update(
+                    job.id
+                    for job in result.jobs
+                    if job.id in tracked
+                    and job.submitted
+                    and tracked[job.id].submitted
+                    and job.submitted != tracked[job.id].submitted
+                )
+            missing.update(job.id for job in result.jobs if job.terminal)
+            if inspect_job and inspect_job not in current:
+                missing.add(inspect_job)
+            # Grouped pending-array IDs cannot be safely turned into a sacct job selector.
+            ids = sorted(jid for jid in missing if re.fullmatch(r"\d+(?:[_+]\d+)?", jid))
+            cached = [record for jid in ids for record in self.accounting_cache.get(jid, [])]
 
-    return usage
+            def cached_matches(jid: str) -> bool:
+                previous = tracked.get(jid) if isinstance(tracked, dict) else None
+                return any(
+                    record.terminal
+                    and record.submitted
+                    and (not previous or record.submitted == previous.submitted)
+                    for record in self.accounting_cache.get(jid, [])
+                )
+
+            query_ids = [
+                jid
+                for jid in ids
+                if not cached_matches(jid)
+                and now - self.accounting_attempts.get(jid, -math.inf) >= 15
+            ]
+            result.accounting = cached
+            if not ids:
+                self.accounting_error = ""
+            if query_ids:
+                try:
+                    records = []
+                    for offset in range(0, len(query_ids), 500):
+                        chunk = query_ids[offset : offset + 500]
+                        self.accounting_attempts.update({jid: now for jid in chunk})
+                        records += [
+                            record
+                            for record in parse_accounting(
+                                self.run(
+                                    [
+                                        "sacct",
+                                        "--local",
+                                        "--allocations",
+                                        "--noheader",
+                                        "--parsable2",
+                                        "--jobs",
+                                        ",".join(chunk),
+                                        "--format",
+                                        "JobID,State,ExitCode,DerivedExitCode,Elapsed,AllocTRES,Partition,User,Submit",
+                                    ]
+                                )
+                            )
+                            if record.id in chunk
+                        ]
+                    result.accounting += records
+                    for jid in query_ids:
+                        self.accounting_cache[jid] = [
+                            record for record in records if record.id == jid and record.terminal
+                        ]
+                    self.accounting_error = ""
+                    while len(self.accounting_cache) > 2000:
+                        self.accounting_cache.pop(next(iter(self.accounting_cache)))
+                except QueryError as error:
+                    self.accounting_error = str(error)
+        if self.accounting_error:
+            result.errors.append(self.accounting_error)
+        self.previous = result
+        return result
 
 
-def create_gpu_table(gpu_info: list[dict], user_gpu_usage: dict = None) -> Table:
-    """Create GPU availability table with per-user breakdown."""
-    table = Table(
-        title="GPU Availability",
-        box=box.ROUNDED,
-        header_style="bold cyan",
-        title_style="bold white",
+def known_sum(values: list[Optional[int]]) -> Optional[int]:
+    return None if any(value is None for value in values) else sum(value or 0 for value in values)
+
+
+def gpu_summary(snapshot: Snapshot, user: str) -> list[dict]:
+    metadata = {part.name: part for part in snapshot.partitions}
+    names = sorted(set(metadata).union(*(set(node.partitions) for node in snapshot.nodes)))
+    records = []
+    for name in names:
+        nodes = [node for node in snapshot.nodes if name in node.partitions]
+        policy = metadata.get(name)
+        free = (
+            known_sum([node.free_gpus for node in nodes])
+            if not policy or policy.state == "UP"
+            else None
+            if policy.state == "UNKNOWN"
+            else 0
+        )
+        mine = known_sum(
+            [
+                job.gpus
+                for job in snapshot.jobs
+                if job.user == user
+                and job.partition == name
+                and not job.terminal
+                and job.state != "PENDING"
+            ]
+        )
+        records.append(
+            dict(
+                name=name,
+                total=known_sum([node.gpus for node in nodes]),
+                used=known_sum([node.used_gpus for node in nodes]),
+                free=free,
+                mine=mine,
+            )
+        )
+    return records
+
+
+def pending_explanation(reason: str) -> str:
+    if reason.startswith(("QOS", "Assoc")):
+        return "Account/QoS limit; free hardware alone is insufficient."
+    return {
+        "Resources": "Waiting for requested resources or node placement.",
+        "Priority": "Other eligible jobs have higher scheduling priority.",
+        "Dependency": "Waiting for a job dependency.",
+        "DependencyNeverSatisfied": "A dependency cannot be satisfied.",
+        "JobHeldUser": "Held by the user.",
+        "JobHeldAdmin": "Held by an administrator.",
+        "InvalidAccount": "Account or partition authorization needs correction.",
+        "PartitionTimeLimit": "Requested time exceeds the partition limit.",
+        "PartitionNodeLimit": "Requested node count exceeds the partition limit.",
+        "Reservation": "Waiting for a reservation.",
+        "ReqNodeNotAvail": "Requested nodes are unavailable or reserved.",
+    }.get(reason, "SLURM supplied this reason; additional policy or constraints may apply.")
+
+
+def resource_suitability(job: Job, snapshot: Snapshot, partition: str) -> tuple[str, list[str]]:
+    """Necessary visible capacity checks only; never predict a scheduling decision."""
+    nodes = [node for node in snapshot.nodes if partition in node.partitions]
+    reasons = []
+    unknown = [
+        "priority, reservations, topology, licenses and scheduler placement are not fully evaluated"
+    ]
+    if job.partition and partition not in job.partition.split(","):
+        reasons.append("partition is outside the current job request")
+    policy = next((p for p in snapshot.partitions if p.name == partition), None)
+    if not snapshot.jobs_ok or not snapshot.nodes_ok:
+        return "Unknown (stale data)", [
+            "A resource query failed; retained data is not suitable for a current assessment."
+        ]
+    if not nodes:
+        return "Unknown", ["No visible nodes in this partition; visibility may be restricted."]
+    if policy:
+        if policy.state != "UP":
+            reasons.append("partition is not UP")
+        if policy.max_nodes is not None and job.nodes is not None and job.nodes > policy.max_nodes:
+            reasons.append("requested node count exceeds MaxNodes")
+        maximum, requested = duration(policy.max_time), duration(job.time_limit)
+        if maximum is not None and requested is not None and requested > maximum:
+            reasons.append("requested time exceeds MaxTime")
+        for value, allowed, label in (
+            (job.account, policy.accounts, "account"),
+            (job.qos, policy.qos, "QoS"),
+        ):
+            if allowed and allowed.upper() not in {"ALL", "(NULL)"}:
+                if value and value not in allowed.split(","):
+                    reasons.append(f"{label} is outside the visible allow list")
+                elif not value:
+                    unknown.append(f"{label} is unknown")
+        if policy.groups.upper() not in {"ALL", "(NULL)"}:
+            unknown.append("group membership is not evaluated")
+    else:
+        unknown.append("partition policy is unavailable")
+    if not snapshot.partitions_at or snapshot.collected_at - snapshot.partitions_at > 60:
+        unknown.append("partition policy may be stale")
+    active = [node for node in nodes if node.usable]
+    if job.nodes is None:
+        unknown.append("requested node count is unknown")
+    elif len(active) < job.nodes:
+        reasons.append("too few active visible nodes")
+    if job.cpus is None:
+        unknown.append("requested CPU count is unknown")
+    else:
+        capacity = known_sum(
+            [
+                max(0, node.cpus - node.used_cpus)
+                if node.cpus is not None and node.used_cpus is not None
+                else None
+                for node in active
+            ]
+        )
+        if capacity is None:
+            unknown.append("free CPU counts are unknown")
+        elif job.cpus > capacity:
+            reasons.append("insufficient visible free CPUs")
+    free = known_sum([node.free_gpus for node in active])
+    if job.requested_gpus is None or free is None:
+        unknown.append("GPU request or free counts are unknown")
+    elif job.requested_gpus > free:
+        reasons.append("insufficient visible free GPUs")
+    for kind, count in job.requested_types.items():
+        free_type = known_sum([node.free_type(kind) for node in active])
+        if free_type is None:
+            unknown.append(f"free {kind} counts are unknown")
+        elif count > free_type:
+            reasons.append(f"insufficient visible free {kind} GPUs")
+    if job.gpu_per_node:
+        candidates = []
+        for node in active:
+            if node.free_gpus is None:
+                unknown.append("per-node GPU allocation is unknown")
+                continue
+            if any(node.free_type(kind) is None for kind in job.gpu_per_node if kind):
+                unknown.append("per-node GPU type allocation is unknown")
+                continue
+            if all(
+                (node.free_gpus if not kind else node.free_type(kind)) >= count
+                for kind, count in job.gpu_per_node.items()
+            ):
+                candidates.append(node)
+        if (
+            job.nodes is not None
+            and len(candidates) < job.nodes
+            and not any("per-node GPU" in reason for reason in unknown)
+        ):
+            reasons.append("too few nodes satisfy the per-node GPU request")
+    if job.memory_per_node is not None:
+        eligible = [
+            node
+            for node in active
+            if node.memory is not None
+            and node.used_memory is not None
+            and node.memory - node.used_memory >= job.memory_per_node
+        ]
+        if any(node.memory is None or node.used_memory is None for node in active):
+            unknown.append("free node memory is unknown")
+        elif job.nodes is not None and len(eligible) < job.nodes:
+            reasons.append("too few nodes satisfy the per-node memory request")
+    else:
+        unknown.append("memory request/distribution is not fully known")
+    if job.memory_total is not None:
+        capacity = known_sum(
+            [
+                max(0, node.memory - node.used_memory)
+                if node.memory is not None and node.used_memory is not None
+                else None
+                for node in active
+            ]
+        )
+        if capacity is not None and job.memory_total > capacity:
+            reasons.append("insufficient visible free memory")
+    if job.features or job.task_resources:
+        unknown.append("feature expressions and per-task placement require scheduler evaluation")
+    if reasons:
+        return "Insufficient visible resources/policy", reasons + unknown
+    incomplete = any(
+        "unknown" in reason
+        or "unavailable" in reason
+        or "stale" in reason
+        or "not fully known" in reason
+        for reason in unknown
+    )
+    return (
+        "Unknown (partial capacity checks)"
+        if incomplete
+        else "Potential resource fit; scheduling unknown"
+    ), unknown
+
+
+@dataclass
+class SendResult:
+    success: bool
+    retry: bool = True
+    delay: float = 0
+    error: str = ""
+
+
+def validate_webhook(value: str) -> None:
+    try:
+        url = urllib.parse.urlsplit(value)
+        valid = (
+            url.scheme == "https"
+            and url.hostname in {"hooks.slack.com", "hooks.slack-gov.com"}
+            and url.path.startswith("/services/")
+            and not url.username
+            and not url.password
+            and url.port in {None, 443}
+            and not url.query
+            and not url.fragment
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("Webhook must be an HTTPS Slack incoming-webhook URL (value redacted).")
+
+
+def load_webhook(cli_value: Optional[str] = None) -> Optional[str]:
+    if cli_value:
+        return cli_value
+    if os.environ.get("SLACK_WEBHOOK_URL"):
+        return os.environ["SLACK_WEBHOOK_URL"]
+    for path in [
+        Path.cwd() / ".env",
+        Path.home() / ".slurm-monitor.env",
+        Path(__file__).parent / ".env",
+    ]:
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            raise ValueError(
+                "Cannot read a Slack configuration file (contents redacted)."
+            ) from None
+        for line in lines:
+            match = re.match(r"^\s*(?:export\s+)?SLACK_WEBHOOK_URL\s*=\s*(.*)$", line)
+            if match:
+                try:
+                    values = shlex.split(match[1], comments=True)
+                except ValueError:
+                    raise ValueError(
+                        "Malformed Slack configuration quoting (contents redacted)."
+                    ) from None
+                if len(values) != 1:
+                    raise ValueError("Slack configuration requires one URL (contents redacted).")
+                return values[0]
+    return None
+
+
+def slack_text(value: object) -> str:
+    return clean(value, 240).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def event_line(event: dict) -> str:
+    job = event["job"]
+    gpu = "?" if job.get("gpus") is None else str(job["gpus"])
+    exit_info = (
+        f"; exit {slack_text(job.get('exit_code') or '?')}, derived {slack_text(job.get('derived_exit_code') or '?')}"
+        if event["kind"] != "started"
+        else ""
+    )
+    return (
+        f"{event['kind'].upper()}: {slack_text(job['id'])} {slack_text(job.get('name', ''))} "
+        f"({slack_text(job.get('partition', ''))}; {gpu} GPUs{exit_info})"
     )
 
-    table.add_column("Partition", style="green", width=15)
-    table.add_column("Mine", style="blue", justify="right", width=6)
-    table.add_column("Available", style="yellow", justify="right", width=10)
-    table.add_column("Total", style="dim", justify="right", width=10)
-    table.add_column("Usage", width=20)
 
-    if user_gpu_usage is None:
-        user_gpu_usage = {}
+def send_slack_notification(webhook_url: str, message: str) -> SendResult:
+    """No secrets in errors. Slack has no webhook idempotency; delivery is at least once."""
+    try:
+        validate_webhook(webhook_url)
+        payload = json.dumps({"text": message, "mrkdwn": False}).encode("utf-8")
+        request = urllib.request.Request(
+            webhook_url, data=payload, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if response.status == 200 and response.read(32).strip() == b"ok":
+                return SendResult(True)
+            return SendResult(False, False, error="Slack returned an unexpected response")
+    except urllib.error.HTTPError as error:
+        try:
+            delay = min(86400, max(1, float(error.headers.get("Retry-After", "5"))))
+            if not math.isfinite(delay):
+                delay = 5
+        except (ValueError, TypeError, AttributeError):
+            delay = 5
+        return SendResult(
+            False,
+            error.code == 429 or error.code >= 500,
+            delay,
+            f"Slack HTTP {error.code} (URL redacted)",
+        )
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return SendResult(False, error="Slack transport failure; event retained")
+    except ValueError:
+        return SendResult(False, False, error="Invalid Slack URL (value redacted)")
 
-    for p in sorted(gpu_info, key=lambda x: x['name']):
-        if p['total'] > 0:
-            usage_pct = ((p['total'] - p['idle']) / p['total']) * 100 if p['total'] > 0 else 0
-            bar_width = 15
 
-            partition_usage = user_gpu_usage.get(p['name'], {'my_gpus': 0, 'others_gpus': 0})
-            my_gpus = partition_usage['my_gpus']
-            others_gpus = partition_usage['others_gpus']
+class JobTracker:
+    """State transitions and an atomic, private delivery journal, independent of the UI."""
 
-            my_blocks = int(my_gpus / p['total'] * bar_width) if p['total'] > 0 else 0
-            others_blocks = int(others_gpus / p['total'] * bar_width) if p['total'] > 0 else 0
-            idle_blocks = bar_width - my_blocks - others_blocks
-            bar = "[blue]" + "█" * my_blocks + "[red]" + "█" * others_blocks + "[green]" + "█" * idle_blocks + "[/]"
+    def __init__(
+        self,
+        state_file: Optional[Path] = None,
+        notify: bool = False,
+        clock: Callable[[], float] = time.time,
+    ):
+        self.path = state_file
+        self.notify = notify
+        self.clock = clock
+        self.lock = threading.RLock()
+        self.file_lock = None
+        self.previous: dict[str, Job] = {}
+        self.awaiting: dict[str, Job] = {}
+        self.history: list[Job] = []
+        self.outbox: list[dict] = []
+        self.initialized = False
+        self.error = ""
+        self.ready = True
+        if state_file:
+            self._open()
 
-            avail_style = "green" if p['idle'] > 0 else "red"
-            my_str = str(my_gpus) if my_gpus > 0 else "-"
-            table.add_row(
-                p['name'],
-                f"[blue]{my_str}[/]",
-                f"[{avail_style}]{p['idle']}[/]",
-                str(p['total']),
-                bar + f" {usage_pct:.0f}%"
+    def _open(self) -> None:
+        assert self.path is not None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+            descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            self.file_lock = os.fdopen(descriptor, "a+")
+            os.fchmod(self.file_lock.fileno(), 0o600)
+            fcntl.flock(self.file_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if self.path.is_symlink():
+                raise StateError("Refusing a symlink delivery journal.")
+            if self.path.exists():
+                os.chmod(self.path, 0o600)
+                payload = json.loads(self.path.read_text(encoding="utf-8"))
+                if payload.get("version") != 1:
+                    raise StateError(
+                        "Unsupported delivery journal version; existing file preserved."
+                    )
+                self.previous = {key: Job(**value) for key, value in payload["previous"].items()}
+                self.awaiting = {key: Job(**value) for key, value in payload["awaiting"].items()}
+                self.history = [Job(**value) for value in payload["history"]]
+                self.outbox = payload["outbox"]
+                self.initialized = bool(payload["initialized"])
+                if not isinstance(payload["initialized"], bool):
+                    raise StateError("Malformed delivery journal; existing file preserved.")
+                for event in self.outbox:
+                    if (
+                        not isinstance(event, dict)
+                        or not {"id", "kind", "job", "attempts", "next_attempt"} <= event.keys()
+                    ):
+                        raise StateError("Malformed delivery journal; existing file preserved.")
+                    Job(**event["job"])
+                    if event["kind"] not in {"started", "completed"} | {
+                        state.lower() for state in TERMINAL
+                    }:
+                        raise StateError("Malformed delivery journal; existing file preserved.")
+                    if (
+                        not isinstance(event["attempts"], int)
+                        or event["attempts"] < 0
+                        or not isinstance(event["id"], str)
+                    ):
+                        raise StateError("Malformed delivery journal; existing file preserved.")
+                    deadline = event["next_attempt"]
+                    if deadline is not None and (
+                        not isinstance(deadline, (int, float)) or not math.isfinite(deadline)
+                    ):
+                        raise StateError("Malformed delivery journal; existing file preserved.")
+                    # A new invocation can correct URL/policy errors; one retry is then allowed.
+                    if event["next_attempt"] is None:
+                        event["next_attempt"] = self.clock()
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+            self.close()
+            label = (
+                "Journal is locked by another monitor"
+                if isinstance(error, BlockingIOError)
+                else "Cannot safely read or lock delivery journal"
             )
+            raise StateError(label + "; existing file preserved.") from None
+        except StateError:
+            self.close()
+            raise
 
+    def close(self) -> None:
+        if self.file_lock:
+            self.file_lock.close()
+            self.file_lock = None
+
+    def _save(self) -> bool:
+        if not self.path:
+            return True
+        temporary = None
+        try:
+            payload = dict(
+                version=1,
+                initialized=self.initialized,
+                previous={k: asdict(v) for k, v in self.previous.items()},
+                awaiting={k: asdict(v) for k, v in self.awaiting.items()},
+                history=[asdict(v) for v in self.history],
+                outbox=self.outbox,
+            )
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=".slurm-monitor-",
+                delete=False,
+            ) as output:
+                temporary = Path(output.name)
+                os.fchmod(output.fileno(), 0o600)
+                json.dump(payload, output, ensure_ascii=False)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.path)
+            self.ready = True
+            if self.error.startswith("Journal write"):
+                self.error = ""
+            return True
+        except (OSError, TypeError, ValueError):
+            self.ready = False
+            self.error = (
+                "Journal write failed: delivery paused; quit only after storage is repaired."
+            )
+            return False
+        finally:
+            try:
+                if temporary and temporary.exists():
+                    temporary.unlink()
+            except OSError:
+                pass  # Leave the private temporary file for recovery if storage fails.
+
+    @property
+    def tracked_ids(self) -> set[str]:
+        with self.lock:
+            return set(self.previous) | set(self.awaiting)
+
+    @property
+    def tracked_jobs(self) -> dict[str, Job]:
+        with self.lock:
+            return {**self.previous, **self.awaiting}
+
+    def _enqueue(self, job: Job, kind: str) -> None:
+        if not self.notify:
+            return
+        token = f"{job.id}|{job.submitted}|{job.restart_count}|{kind}|{job.state}|{job.exit_code}"
+        identifier = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        if any(event["id"] == identifier for event in self.outbox):
+            return
+        self.outbox.append(
+            dict(id=identifier, kind=kind, job=asdict(job), attempts=0, next_attempt=self.clock())
+        )
+
+    def observe(self, snapshot: Snapshot, jobs: list[Job]) -> None:
+        with self.lock:
+            if not snapshot.jobs_ok:
+                return  # Failed queries cannot alter the baseline or emit endings.
+            current = {job.id: job for job in jobs if not job.terminal}
+            if not self.initialized:
+                self.previous = current
+                self.initialized = True
+                self._save()
+                return  # Snooze initial running jobs, including after a fresh installation.
+            for jid, job in current.items():
+                previous = self.previous.get(jid) or self.awaiting.get(jid)
+                if (
+                    previous
+                    and previous.submitted
+                    and job.submitted
+                    and previous.submitted != job.submitted
+                ):
+                    self.awaiting.setdefault(jid, previous)
+                    previous = None  # Numeric job ID reuse is a new generation.
+                if job.state == "RUNNING" and (
+                    previous is None
+                    or previous.state in {"PENDING", "CONFIGURING", "REQUEUED", "REQUEUE_HOLD"}
+                ):
+                    self._enqueue(job, "started")
+                pending = self.awaiting.get(jid)
+                if (
+                    pending is None
+                    or not pending.submitted
+                    or not job.submitted
+                    or pending.submitted == job.submitted
+                ):
+                    self.awaiting.pop(jid, None)
+            for jid, job in self.previous.items():
+                if jid not in current and "[" not in jid:
+                    self.awaiting.setdefault(jid, job)
+            for record in snapshot.accounting:
+                if not record.terminal or record.id not in self.awaiting:
+                    continue
+                expected = self.awaiting[record.id]
+                if expected.submitted and expected.submitted != record.submitted:
+                    continue
+                previous = self.awaiting.pop(record.id)
+                ended = Job(
+                    **{
+                        **asdict(previous),
+                        **{
+                            k: v
+                            for k, v in asdict(record).items()
+                            if k
+                            in {
+                                "state",
+                                "runtime",
+                                "gpus",
+                                "gpu_types",
+                                "exit_code",
+                                "derived_exit_code",
+                            }
+                        },
+                    }
+                )
+                self.history = ([ended] + [job for job in self.history if job.id != ended.id])[:100]
+                self._enqueue(
+                    ended, "completed" if ended.state == "COMPLETED" else ended.state.lower()
+                )
+            self.previous = current
+            self._save()  # Persist transitions and events before any HTTP request.
+
+    def deliver(self, sender: Callable[[str], SendResult]) -> bool:
+        with self.lock:
+            if not self.ready and not self._save():
+                return False
+            eligible = [
+                event
+                for event in self.outbox
+                if event["next_attempt"] is not None and event["next_attempt"] <= self.clock()
+            ]
+            selected = []
+            lines = []
+            for event in eligible:
+                line = event_line(event)
+                if sum(len(v) + 1 for v in lines) + len(line) > 3500:
+                    break
+                selected.append(event)
+                lines.append(line)
+            if not selected:
+                return False
+            # Journal was saved by observe/load; in-memory events need no persistence.
+            if not self._save():
+                return False
+        try:
+            result = sender("\n".join(lines))
+        except Exception:
+            result = SendResult(False, error="Slack delivery failed; event retained")
+        with self.lock:
+            ids = {event["id"] for event in selected}
+            if result.success:
+                self.outbox = [event for event in self.outbox if event["id"] not in ids]
+                self.error = ""
+            else:
+                self.error = result.error
+                for event in self.outbox:
+                    if event["id"] in ids:
+                        event["attempts"] += 1
+                        event["next_attempt"] = (
+                            (
+                                self.clock()
+                                + max(
+                                    result.delay, min(300, 5 * 2 ** min(event["attempts"] - 1, 6))
+                                )
+                            )
+                            if result.retry
+                            else None
+                        )
+            self._save()
+        return True
+
+    def status(self) -> tuple[int, int, str]:
+        with self.lock:
+            return len(self.outbox), len(self.awaiting), self.error
+
+
+class DeliveryWorker:
+    def __init__(self, tracker: JobTracker, sender: Callable[[str], SendResult]):
+        self.tracker = tracker
+        self.sender = sender
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="slurm-monitor-slack", daemon=True)
+
+    def _run(self) -> None:
+        while not self.stop.is_set():
+            attempted = self.tracker.deliver(self.sender)
+            self.stop.wait(1 if attempted else 0.5)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def close(self) -> bool:
+        self.stop.set()
+        self.thread.join(timeout=11)
+        return not self.thread.is_alive()
+
+
+def fmt_count(value: Optional[int]) -> str:
+    return "?" if value is None else str(value)
+
+
+def visible_jobs(
+    snapshot: Snapshot,
+    user: str,
+    show_all: bool = False,
+    partition: Optional[str] = None,
+    job_id: Optional[str] = None,
+) -> list[Job]:
+    return [
+        job
+        for job in snapshot.jobs
+        if (show_all or job.user == user or job_id == job.id)
+        and (not partition or partition in job.partition.split(","))
+        and (not job_id or job.id == job_id)
+    ]
+
+
+def job_table(jobs: list[Job], limit: int, narrow: bool = False) -> Table:
+    shown = jobs if limit == 0 else jobs[:limit]
+    title = f"Jobs: {len(shown)}/{len(jobs)} shown"
+    if len(shown) < len(jobs):
+        title += f" ({len(jobs) - len(shown)} hidden; --max-jobs 0 shows all)"
+    table = Table(title=literal(title), expand=True, show_lines=False)
+    for name in (
+        ["ID", "Name", "State", "GPU", "Reason / exit"]
+        if narrow
+        else ["ID", "Name", "User", "Partition", "State", "GPUs", "Runtime", "Reason / exit"]
+    ):
+        table.add_column(name, overflow="ellipsis", no_wrap=True)
+    for job in shown:
+        info = (
+            job.reason
+            if job.state == "PENDING"
+            else (f"{job.exit_code} / {job.derived_exit_code}" if job.terminal else "")
+        )
+        gpu = fmt_count(job.requested_gpus if job.state == "PENDING" else job.gpus)
+        style = (
+            "yellow"
+            if job.state == "PENDING"
+            else "green"
+            if job.state == "RUNNING"
+            else "red"
+            if job.terminal and job.state != "COMPLETED"
+            else "cyan"
+        )
+        row = (
+            [
+                literal(job.id),
+                literal(job.name),
+                literal(job.state, style),
+                literal(gpu),
+                literal(info),
+            ]
+            if narrow
+            else [
+                literal(job.id),
+                literal(job.name),
+                literal(job.user),
+                literal(job.partition),
+                literal(job.state, style),
+                literal(gpu),
+                literal(job.runtime),
+                literal(info),
+            ]
+        )
+        table.add_row(*row)
+    if not shown:
+        table.add_row(
+            *[literal("No visible jobs" if i == 1 else "-") for i in range(len(table.columns))]
+        )
     return table
 
 
-def create_partition_detail_table(partition: str) -> Table:
-    """Create a table showing per-node GPU and CPU availability for a partition."""
-    nodes = get_partition_nodes(partition)
-
+def gpu_table(
+    snapshot: Snapshot, user: str, limit: int = 0, jobs: Optional[list[Job]] = None
+) -> Table:
     table = Table(
-        title=f"Partition: {partition}",
-        box=box.ROUNDED,
-        header_style="bold cyan",
-        title_style="bold white",
+        title="GPU inventory and visible job summary (shared nodes may overlap)", expand=True
     )
-
-    table.add_column("Node", style="cyan", width=20)
-    table.add_column("State", width=10)
-    table.add_column("CPUs", width=18)
-    table.add_column("GPUs", width=18)
-
-    # State color mapping
-    state_colors = {
-        'idle': 'green',
-        'mix': 'yellow',
-        'alloc': 'red',
-        'allocated': 'red',
-        'down': 'dim',
-        'drain': 'dim',
-        'drng': 'dim',
-    }
-
-    totals = {'cpus_alloc': 0, 'cpus_total': 0, 'gpus_avail': 0, 'gpus_total': 0}
-
-    for node in nodes:
-        state = node['state']
-        state_color = state_colors.get(state, 'white')
-
-        # CPU usage bar
-        cpu_alloc = node['cpus_alloc']
-        cpu_total = node['cpus_total']
-        if cpu_total > 0:
-            cpu_usage_pct = (cpu_alloc / cpu_total) * 100
-            cpu_bar_width = 8
-            cpu_filled = int(cpu_usage_pct / 100 * cpu_bar_width)
-            cpu_bar = "[red]" + "█" * cpu_filled + "[green]" + "█" * (cpu_bar_width - cpu_filled) + "[/]"
-            cpu_text = f"{cpu_alloc:>3}/{cpu_total:<3} {cpu_bar}"
-        else:
-            cpu_text = "-"
-
-        # GPU usage bar
-        gpu_avail = node['gpus_avail']
-        gpu_total = node['gpus_total']
-        if gpu_total > 0:
-            gpu_usage_pct = ((gpu_total - gpu_avail) / gpu_total) * 100
-            gpu_bar_width = 8
-            gpu_filled = int(gpu_usage_pct / 100 * gpu_bar_width)
-            gpu_bar = "[red]" + "█" * gpu_filled + "[green]" + "█" * (gpu_bar_width - gpu_filled) + "[/]"
-            gpu_text = f"{gpu_avail:>2}/{gpu_total:<2} {gpu_bar}"
-        else:
-            gpu_text = "-"
-
+    for name in ["Partition", "Run", "Pend", "Mine", "Used", "Free*", "Total"]:
+        table.add_column(name, no_wrap=True, overflow="ellipsis")
+    records = gpu_summary(snapshot, user)
+    for record in records[: limit or None]:
+        partition_jobs = [
+            job
+            for job in (jobs if jobs is not None else snapshot.jobs)
+            if record["name"] in job.partition.split(",")
+        ]
         table.add_row(
-            node['name'],
-            f"[{state_color}]{state}[/]",
-            cpu_text,
-            gpu_text
+            literal(record["name"]),
+            literal(sum(job.state == "RUNNING" for job in partition_jobs)),
+            literal(sum(job.state == "PENDING" for job in partition_jobs)),
+            *[literal(fmt_count(record[key])) for key in ("mine", "used", "free", "total")],
         )
-
-        totals['cpus_alloc'] += cpu_alloc
-        totals['cpus_total'] += cpu_total
-        totals['gpus_avail'] += gpu_avail
-        totals['gpus_total'] += gpu_total
-
-    # Add totals row
-    if nodes:
-        table.add_section()
-        if totals['cpus_total'] > 0:
-            cpu_total_text = f"{totals['cpus_alloc']}/{totals['cpus_total']}"
-        else:
-            cpu_total_text = "-"
-        if totals['gpus_total'] > 0:
-            gpu_total_text = f"{totals['gpus_avail']}/{totals['gpus_total']}"
-        else:
-            gpu_total_text = "-"
+    if limit and len(records) > limit:
         table.add_row(
-            f"[bold]Total ({len(nodes)} nodes)[/]",
-            "",
-            f"[bold]{cpu_total_text}[/]",
-            f"[bold]{gpu_total_text}[/]"
+            literal(f"{len(records) - limit} more partitions"), *[literal("…") for _ in range(6)]
+        )
+    return table
+
+
+def node_table(snapshot: Snapshot, partition: str, limit: int = 0) -> Table:
+    nodes = [node for node in snapshot.nodes if partition in node.partitions]
+    table = Table(title=literal(f"{partition}: {len(nodes)} nodes"), expand=True)
+    for name in ["Node", "State", "CPU used/total", "GPU free/total"]:
+        table.add_column(name, overflow="ellipsis", no_wrap=True)
+    for node in nodes[: limit or None]:
+        table.add_row(
+            literal(node.name),
+            literal("+".join(node.states)),
+            literal(f"{fmt_count(node.used_cpus)}/{fmt_count(node.cpus)}"),
+            literal(f"{fmt_count(node.free_gpus)}/{fmt_count(node.gpus)}"),
+        )
+    if limit and len(nodes) > limit:
+        table.add_row(
+            literal(f"{len(nodes) - limit} hidden"),
+            literal("--max-jobs 0"),
+            literal("…"),
+            literal("…"),
+        )
+    return table
+
+
+def diagnostic_panel(
+    job: Job, snapshot: Snapshot, partition: Optional[str], concise: bool = False
+) -> Panel:
+    lines = [f"Job {job.id}: {job.name} ({job.state})"]
+    if job.terminal:
+        lines += [
+            f"Runtime: {job.runtime}; batch exit: {job.exit_code or 'unknown'}; derived step exit: {job.derived_exit_code or 'unknown'}",
+            "Exit format is exit-code:signal. Derived exit can reveal a failed step even when the batch script returned zero.",
+        ]
+    elif job.state == "PENDING":
+        lines += [
+            f"Reason: {job.reason or 'unknown'}. {pending_explanation(job.reason)}",
+            f"Request: {fmt_count(job.nodes)} nodes, {fmt_count(job.cpus)} CPUs, {fmt_count(job.requested_gpus)} GPUs; "
+            f"GPU types: {job.requested_types or 'unspecified/unknown'}; memory {fmt_count(job.memory_total)} MiB total / "
+            f"{fmt_count(job.memory_per_node)} MiB per node; time limit: {job.time_limit or 'unknown'}.",
+        ]
+        candidates = [partition] if partition else [v for v in job.partition.split(",") if v]
+        for name in candidates[:6]:
+            status, reasons = resource_suitability(job, snapshot, name)
+            lines.append(f"{name}: {status}. " + "; ".join(reasons))
+        if len(candidates) > 6:
+            lines.append(f"{len(candidates) - 6} additional partitions omitted; use --partition.")
+        lines.append(
+            "Resource suitability is not a scheduler guarantee. No job is submitted or modified."
         )
     else:
-        table.add_row("-", f"No nodes found in partition '{partition}'", "-", "-")
-
-    return table
-
-
-def create_dashboard(user: str, show_all: bool) -> Layout:
-    """Create the main dashboard layout."""
-    console = Console()
-
-    # Get data
-    all_jobs = get_jobs()
-    jobs = all_jobs if show_all else [j for j in all_jobs if j['user'] == user]
-    gpu_info = get_gpu_availability()
-    cluster = get_cluster_summary()
-    user_gpu_usage = get_user_gpu_usage(all_jobs, user)
-
-    # Create layout
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="main"),
-        Layout(name="footer", size=3)
+        lines += [
+            f"Allocated GPUs: {fmt_count(job.gpus)}; runtime: {job.runtime or 'unknown'}",
+            "GPU counts represent SLURM allocations, not measured device utilization.",
+        ]
+    if concise:
+        lines = lines[:3] + [
+            "Scheduling is not guaranteed; unknown constraints may apply.",
+            "Use --once --job ID for full diagnostics.",
+        ]
+    return Panel(
+        Text("\n".join(clean(line, 100 if concise else 1200) for line in lines)),
+        title="Job diagnostics",
     )
 
-    layout["main"].split_row(
-        Layout(name="left", ratio=2),
-        Layout(name="right", ratio=1)
+
+def render_snapshot(
+    snapshot: Snapshot,
+    tracker: JobTracker,
+    args: argparse.Namespace,
+    user: str,
+    width: int,
+    height: int,
+    terminal: bool = False,
+) -> Group:
+    jobs = visible_jobs(
+        snapshot, user, args.all_users, args.partition if not args.job else None, args.job
     )
-
-    layout["left"].split_column(
-        Layout(name="running", ratio=2),
-        Layout(name="summary", size=12),
-        Layout(name="pending", ratio=2)
-    )
-
-    # Header
-    user_display = "All Users" if show_all else user
-    gpus_total = sum(p['total'] for p in gpu_info)
-    header_text = Text()
-    header_text.append("  SLURM Job Monitor", style="bold white")
-    header_text.append(f"  |  User: {user_display}", style="cyan")
-    header_text.append(f"  |  GPUs: {cluster['gpus_in_use']}/{gpus_total}", style="yellow")
-    header_text.append(f"  |  {datetime.now().strftime('%H:%M:%S')}", style="dim")
-    layout["header"].update(Panel(header_text, style="blue"))
-
-    # Job tables
-    running_jobs = [j for j in jobs if j['state'] == 'RUNNING']
-    pending_jobs = [j for j in jobs if j['state'] == 'PENDING']
-
-    layout["running"].update(create_job_table(jobs, f"Running Jobs ({len(running_jobs)})", "RUNNING"))
-    layout["summary"].update(create_summary_table(jobs))
-    layout["pending"].update(create_job_table(jobs, f"Pending Jobs ({len(pending_jobs)})", "PENDING"))
-
-    # GPU availability
-    layout["right"].update(create_gpu_table(gpu_info, user_gpu_usage))
-
-    # Footer
-    footer_text = Text()
-    footer_text.append("  Press Ctrl+C to exit", style="dim")
-    footer_text.append("  |  Refresh: 5s", style="dim")
-    layout["footer"].update(Panel(footer_text, style="dim"))
-
-    return layout
-
-
-def create_compact_view(user: str, show_all: bool) -> Table:
-    """Create a compact single-table view."""
-    jobs = get_jobs(None if show_all else user)
-
-    table = Table(
-        title=f"SLURM Jobs ({datetime.now().strftime('%H:%M:%S')})",
-        box=box.ROUNDED,
-        header_style="bold cyan",
-        show_lines=True
-    )
-
-    table.add_column("ID", style="yellow", width=10)
-    table.add_column("Name", style="white", width=30)
-    table.add_column("Partition", style="green", width=12)
-    table.add_column("State", width=10)
-    table.add_column("GPUs", style="magenta", width=8)
-    table.add_column("Time", style="cyan", width=12)
-    table.add_column("Reason", style="dim", width=20)
-
-    for job in jobs:
-        state_style = "green" if job['state'] == 'RUNNING' else "yellow"
-        gpu_info = job['gres'].replace('gpu:', '') if 'gpu' in job['gres'] else '-'
-        reason = job['reason'] if job['state'] == 'PENDING' else ''
-
-        table.add_row(
-            job['id'],
-            job['name'],
-            job['partition'],
-            f"[{state_style}]{job['state']}[/]",
-            gpu_info,
-            job['time'],
-            reason
+    jobs = sorted(jobs, key=lambda job: (job.state != "PENDING", job.id))
+    pending, waiting, delivery_error = tracker.status()
+    errors = list(snapshot.errors) + ([delivery_error] if delivery_error else [])
+    if not snapshot.jobs_ok:
+        errors.append(
+            f"Jobs STALE: last successful snapshot age {max(0, snapshot.collected_at - snapshot.jobs_at):.0f}s"
         )
-
-    if not jobs:
-        table.add_row("-", "No jobs found", "-", "-", "-", "-", "-")
-
-    return table
-
-
-def create_partition_view(partition: str) -> Layout:
-    """Create a view showing detailed node information for a partition."""
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="main"),
-    )
-
-    # Header
-    header = Panel(
-        Text(
-            f"SLURM Partition Detail  |  Partition: {partition}  |  {datetime.now().strftime('%H:%M:%S')}",
-            justify="center",
-            style="bold white"
-        ),
-        box=box.ROUNDED,
-        style="cyan"
-    )
-    layout["header"].update(header)
-
-    # Main content
-    layout["main"].update(create_partition_detail_table(partition))
-
-    return layout
-
-
-def main():
-    parser = argparse.ArgumentParser(description="SLURM Job Monitor")
-    parser.add_argument('--interval', '-i', type=int, default=5, help="Refresh interval in seconds")
-    parser.add_argument('--all-users', '-a', action='store_true', help="Show jobs from all users")
-    parser.add_argument('--once', '-1', action='store_true', help="Run once and exit")
-    parser.add_argument('--compact', '-c', action='store_true', help="Compact single-table view")
-    parser.add_argument('--partition', '-p', type=str, default=None, help="Show detailed node info for specific partition")
-    parser.add_argument('--slack', '-s', action='store_true', help="Enable Slack notifications for job events")
-    parser.add_argument('--slack-webhook', type=str, help="Slack webhook URL (overrides .env)")
-    args = parser.parse_args()
-
-    user = os.environ.get('USER', 'unknown')
-    console = Console()
-
-    # Setup Slack notifications if enabled
-    job_tracker = None
-    if args.slack:
-        env_vars = load_env_file()
-        webhook_url = args.slack_webhook or env_vars.get('SLACK_WEBHOOK_URL')
-
-        if webhook_url:
-            job_tracker = JobTracker(webhook_url=webhook_url, console=console)
-            console.print(f"[green]Slack notifications enabled[/]")
-            # Initialize job tracker with current jobs (snooze first cycle)
-            initial_jobs = get_jobs(None if args.all_users else user)
-            job_tracker.previous_jobs = {job['id']: job for job in initial_jobs}
-            job_tracker.notified_starts = {job['id'] for job in initial_jobs if job['state'] == 'RUNNING'}
-        else:
-            console.print("[yellow]Warning: --slack enabled but no webhook URL found.[/]")
-            console.print("[yellow]Set SLACK_WEBHOOK_URL in .env or use --slack-webhook[/]")
-
-    if args.once:
-        if args.partition:
-            console.print(create_partition_view(args.partition))
-        elif args.compact:
-            console.print(create_compact_view(user, args.all_users))
-        else:
-            console.print(create_dashboard(user, args.all_users))
-        return
-
-    try:
-        if args.partition:
-            with Live(create_partition_view(args.partition), refresh_per_second=1, screen=True) as live:
-                while True:
-                    time.sleep(args.interval)
-                    live.update(create_partition_view(args.partition))
-        elif args.compact:
-            with Live(create_compact_view(user, args.all_users), refresh_per_second=1) as live:
-                while True:
-                    time.sleep(args.interval)
-                    # Track job changes for Slack notifications
-                    if job_tracker:
-                        jobs = get_jobs(None if args.all_users else user)
-                        job_tracker.update(jobs)
-                    live.update(create_compact_view(user, args.all_users))
-        else:
-            with Live(create_dashboard(user, args.all_users), refresh_per_second=1, screen=True) as live:
-                while True:
-                    time.sleep(args.interval)
-                    # Track job changes for Slack notifications
-                    if job_tracker:
-                        jobs = get_jobs(None if args.all_users else user)
-                        job_tracker.update(jobs)
-                    live.update(create_dashboard(user, args.all_users))
-    except KeyboardInterrupt:
-        if job_tracker:
-            send_slack_notification(
-                job_tracker.webhook_url,
-                ":wave: *SLURM Monitor Stopped*",
-                ":computer:"
+    if not snapshot.nodes_ok:
+        errors.append(
+            f"Nodes STALE: last successful snapshot age {max(0, snapshot.collected_at - snapshot.nodes_at):.0f}s"
+        )
+    total = known_sum([node.gpus for node in snapshot.nodes])
+    used = known_sum([node.used_gpus for node in snapshot.nodes])
+    header = f"SLURM Monitor | {'all users' if args.all_users else user} | GPUs allocated {fmt_count(used)}/{fmt_count(total)} (unique nodes)"
+    footer = f"Refresh: {args.interval:g}s | {datetime.fromtimestamp(snapshot.collected_at).strftime('%H:%M:%S')} | Slack queued: {pending} | endings awaiting accounting: {waiting} | Ctrl+C exits"
+    limit = args.max_jobs
+    if terminal and limit and not args.job:
+        limit = max(1, min(limit, height - (12 if args.compact or width < 100 else 23)))
+    if terminal and height < 12:
+        message = [
+            header,
+            f"{len(jobs)} jobs; {len(errors)} query/delivery errors. Refresh {args.interval:g}s.",
+        ]
+        message += [f"{job.id} {job.state} {job.name}" for job in jobs[: max(1, height - 6)]]
+        if len(jobs) > max(1, height - 6):
+            message.append("More jobs hidden; resize or use --once --max-jobs 0.")
+        message += errors[:1]
+        return Group(Text("\n".join(clean(line) for line in message)))
+    parts = [Panel(literal(header), style="cyan")]
+    if errors:
+        parts.append(
+            Panel(
+                Text("\n".join(clean(error) for error in errors)),
+                title="Errors / stale data",
+                style="red",
             )
-        console.print("\n[yellow]Monitor stopped.[/]")
+        )
+    parts.append(job_table(jobs, limit, width < 100))
+    if args.partition and not args.compact:
+        parts.append(node_table(snapshot, args.partition, limit))
+    elif not args.compact and width >= 100 and (not terminal or height >= 28):
+        parts.append(gpu_table(snapshot, user, max(1, height // 5) if terminal else 0, jobs))
+    if args.job:
+        selected = next((job for job in jobs if job.id == args.job), None)
+        if selected is None:
+            selected = next((job for job in snapshot.accounting if job.id == args.job), None)
+        if selected:
+            accounting = next(
+                (
+                    record
+                    for record in snapshot.accounting
+                    if record.id == selected.id and record.terminal
+                ),
+                None,
+            )
+            if selected.terminal and accounting:
+                selected = Job(
+                    **{
+                        **asdict(selected),
+                        **{
+                            key: getattr(accounting, key)
+                            for key in ("exit_code", "derived_exit_code", "runtime")
+                        },
+                    }
+                )
+            parts.append(
+                diagnostic_panel(selected, snapshot, args.partition, terminal and height < 35)
+            )
+        else:
+            parts.append(
+                Panel(
+                    literal("Job not visible; accounting may be delayed, disabled or restricted."),
+                    title="Job diagnostics",
+                )
+            )
+    else:
+        with tracker.lock:
+            history = tracker.history[:3]
+        if history and (not terminal or height >= 35):
+            parts.append(job_table(history, 3, width < 100))
+    parts += [
+        literal(
+            "* Free = unallocated GPUs on active nodes. CPU/memory, reservations and partition policy can still prevent scheduling. ? = unknown.",
+            "dim",
+        ),
+        literal(footer, "dim"),
+    ]
+    return Group(*parts)
+
+
+def positive_interval(value: str) -> float:
+    try:
+        result = float(value)
+        if not math.isfinite(result) or result < 1:
+            raise ValueError
+        return result
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "interval must be a finite number of at least 1 second"
+        ) from None
+
+
+def nonnegative(value: str) -> int:
+    try:
+        result = int(value)
+        if result < 0:
+            raise ValueError
+        return result
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer") from None
+
+
+def job_identifier(value: str) -> str:
+    if not re.fullmatch(r"\d+(?:[_+]\d+)?", value):
+        raise argparse.ArgumentTypeError(
+            "job ID must be numeric, optionally with an array/heterogeneous suffix"
+        )
+    return value
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Read-only SLURM job and GPU monitor")
+    parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument(
+        "--interval",
+        "-i",
+        type=positive_interval,
+        default=5,
+        help="Refresh seconds (at least 1; default 5)",
+    )
+    parser.add_argument("--all-users", "-a", action="store_true")
+    parser.add_argument("--once", "-1", action="store_true")
+    parser.add_argument("--compact", "-c", action="store_true")
+    parser.add_argument("--partition", "-p", help="Node details / assessment partition")
+    parser.add_argument(
+        "--job",
+        type=job_identifier,
+        help="Inspect pending suitability or completed exit information",
+    )
+    parser.add_argument(
+        "--max-jobs", type=nonnegative, default=15, help="Row limit; 0 shows all (default 15)"
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="One read-only machine-readable snapshot"
+    )
+    parser.add_argument("--slack", "-s", action="store_true")
+    parser.add_argument(
+        "--slack-webhook",
+        help="Override Slack URL; prefer the environment to avoid shell-history exposure",
+    )
+    parser.add_argument(
+        "--state-file", type=Path, help="Private Slack journal; default is scoped by host/user/view"
+    )
+    return parser.parse_args(argv)
+
+
+def default_state_file(args: argparse.Namespace, user: str) -> Path:
+    scope = json.dumps([socket.gethostname(), user, args.all_users, args.partition, args.job])
+    token = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
+    base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    return base / "slurm-monitor" / f"{token}.json"
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = parse_args(argv)
+    console = Console()
+    user = getpass.getuser()
+    webhook = None
+    tracker = None
+    worker = None
+    try:
+        if args.slack:
+            webhook = load_webhook(args.slack_webhook)
+            if not webhook:
+                raise ValueError("--slack requires SLACK_WEBHOOK_URL or --slack-webhook")
+            validate_webhook(webhook)
+        tracker = JobTracker(
+            args.state_file or default_state_file(args, user) if webhook else None,
+            notify=bool(webhook),
+        )
+        collector = Collector()
+        collector.user = None if args.all_users or args.job else user
+        if webhook:
+            worker = DeliveryWorker(
+                tracker, lambda message: send_slack_notification(webhook, message)
+            )
+            worker.start()
+
+        def collect() -> Snapshot:
+            snapshot = collector.collect(tracker.tracked_jobs, args.job)
+            jobs = visible_jobs(
+                snapshot, user, args.all_users, args.partition if not args.job else None, args.job
+            )
+            tracker.observe(snapshot, jobs)
+            return snapshot
+
+        snapshot = collect()
+        if args.once or args.json or not console.is_terminal:
+            if args.json:
+                payload = asdict(snapshot)
+                payload["jobs"] = [
+                    asdict(job)
+                    for job in visible_jobs(
+                        snapshot,
+                        user,
+                        args.all_users,
+                        args.partition if not args.job else None,
+                        args.job,
+                    )
+                ]
+                print(json.dumps(payload, ensure_ascii=False))
+            else:
+                console.print(
+                    render_snapshot(snapshot, tracker, args, user, console.width, console.height)
+                )
+            return 0 if snapshot.jobs_ok and snapshot.nodes_ok and not snapshot.errors else 1
+        with Live(
+            render_snapshot(snapshot, tracker, args, user, console.width, console.height, True),
+            console=console,
+            refresh_per_second=1,
+            screen=True,
+            vertical_overflow="ellipsis",
+        ) as live:
+            while True:
+                time.sleep(args.interval)
+                snapshot = collect()
+                live.update(
+                    render_snapshot(
+                        snapshot, tracker, args, user, console.width, console.height, True
+                    )
+                )
+    except KeyboardInterrupt:
+        console.print(
+            literal(
+                "Monitor stopped; queued Slack events remain in the delivery journal.", "yellow"
+            )
+        )
+        return 0
+    except (ValueError, StateError) as error:
+        console.print(literal(str(error), "red"))
+        return 2
+    finally:
+        stopped = worker.close() if worker else True
+        if tracker and stopped:
+            tracker.close()
+        if not stopped:
+            console.print(
+                literal(
+                    "Delivery shutdown timed out; pending journal retained. A request may have reached Slack.",
+                    "yellow",
+                )
+            )
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,0 +1,3 @@
+PartitionName=gpu State=UP MaxTime=2:00:00 MaxNodes=4 AllowAccounts=research AllowQos=normal AllowGroups=ALL
+PartitionName=shared State=UP MaxTime=1:00:00 MaxNodes=2 AllowAccounts=ALL AllowQos=ALL AllowGroups=ALL
+PartitionName=cpu State=UP MaxTime=UNLIMITED MaxNodes=UNLIMITED AllowAccounts=ALL AllowQos=ALL AllowGroups=ALL
