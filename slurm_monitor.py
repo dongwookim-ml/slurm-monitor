@@ -31,7 +31,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 TERMINAL = {
     "COMPLETED",
     "FAILED",
@@ -1436,52 +1436,171 @@ def job_table(jobs: list[Job], limit: int, narrow: bool = False) -> Table:
     return table
 
 
-def gpu_table(
-    snapshot: Snapshot, user: str, limit: int = 0, jobs: Optional[list[Job]] = None
-) -> Table:
-    table = Table(
-        title="GPU inventory and visible job summary (shared nodes may overlap)", expand=True
+def gpu_legend() -> Text:
+    legend = Text()
+    for text, style in (
+        ("█ U=Used  ", "bold bright_red"),
+        ("░ I=Idle*  ", "bright_green"),
+        ("× X=Unavailable  ", "bright_black"),
+        ("?=Unknown", "bright_yellow"),
+    ):
+        legend.append(text, style)
+    return legend
+
+
+def gpu_meter(
+    total: Optional[int],
+    used: Optional[int],
+    idle: Optional[int],
+    width: int = 20,
+    stacked: bool = False,
+) -> Text:
+    """Proportional inventory, with unknown capacity never painted as idle."""
+    width = max(1, width)
+    invalid = any(value is not None and value < 0 for value in (total, used, idle))
+    known = (used or 0) + (idle or 0)
+    invalid |= total is not None and known > total
+    unavailable = (
+        total - known
+        if total is not None and used is not None and idle is not None and not invalid
+        else None
     )
-    for name in ["Partition", "Run", "Pend", "Mine", "Used", "Free*", "Total"]:
-        table.add_column(name, no_wrap=True, overflow="ellipsis")
+    bar = Text()
+    if invalid or total is None:
+        bar.append("?" * width, "bright_yellow")
+    elif total == 0:
+        bar.append("No GPUs", "dim")
+    else:
+        counts = [
+            used or 0,
+            idle or 0,
+            unavailable or 0,
+            total - known if unavailable is None else 0,
+        ]
+        quotas = [count * width / total for count in counts]
+        cells = [int(quota) for quota in quotas]
+        for i in sorted(range(4), key=lambda i: quotas[i] - cells[i], reverse=True)[
+            : width - sum(cells)
+        ]:
+            cells[i] += 1
+        # Keep small nonzero segments visible when there are enough cells.
+        if width >= sum(count > 0 for count in counts):
+            for i, count in enumerate(counts):
+                if count and not cells[i]:
+                    donor = max(range(4), key=lambda j: cells[j])
+                    cells[donor] -= 1
+                    cells[i] = 1
+        for cells_count, symbol, style in zip(
+            cells,
+            ("█", "░", "×", "?"),
+            ("bold bright_red", "bright_green", "bright_black", "bright_yellow"),
+        ):
+            bar.append(symbol * cells_count, style)
+    bar.append("\n" if stacked else "  ")
+    bar.append(
+        f"U{fmt_count(used)} I{fmt_count(idle)} X{fmt_count(unavailable)} /{fmt_count(total)}",
+        "dim",
+    )
+    if invalid:
+        bar.append(" (inconsistent)", "yellow")
+    return bar
+
+
+def gpu_table(
+    snapshot: Snapshot,
+    user: str,
+    limit: int = 0,
+    jobs: Optional[list[Job]] = None,
+    width: int = 100,
+) -> Table:
+    narrow = width < 75
+    table = Table(
+        title="Partition GPUs (shared nodes may overlap)",
+        caption=gpu_legend(),
+        expand=True,
+    )
+    table.add_column(
+        "Partition",
+        max_width=20 if not narrow else max(8, width // 3),
+        overflow="ellipsis",
+        no_wrap=True,
+    )
+    if not narrow:
+        for name in ["Run", "Pend", "Mine"] if width >= 100 else ["R/P", "Mine"]:
+            table.add_column(name, justify="right", no_wrap=True)
+    table.add_column("GPU allocation", ratio=2, overflow="fold")
     records = gpu_summary(snapshot, user)
+    if limit:
+        records.sort(key=lambda record: (record["total"] == 0, record["name"]))
     for record in records[: limit or None]:
         partition_jobs = [
             job
             for job in (jobs if jobs is not None else snapshot.jobs)
             if record["name"] in job.partition.split(",")
         ]
-        table.add_row(
-            literal(record["name"]),
-            literal(sum(job.state == "RUNNING" for job in partition_jobs)),
-            literal(sum(job.state == "PENDING" for job in partition_jobs)),
-            *[literal(fmt_count(record[key])) for key in ("mine", "used", "free", "total")],
+        row = [literal(record["name"])]
+        if not narrow:
+            running = sum(job.state == "RUNNING" for job in partition_jobs)
+            pending = sum(job.state == "PENDING" for job in partition_jobs)
+            row += (
+                [literal(running), literal(pending)]
+                if width >= 100
+                else [literal(f"{running}/{pending}")]
+            )
+            row.append(literal(fmt_count(record["mine"]), "cyan"))
+        row.append(
+            gpu_meter(
+                record["total"],
+                record["used"],
+                record["free"],
+                10 if narrow else 20 if width < 100 else 24,
+                narrow,
+            )
         )
+        table.add_row(*row)
     if limit and len(records) > limit:
         table.add_row(
-            literal(f"{len(records) - limit} more partitions"), *[literal("…") for _ in range(6)]
+            literal(f"{len(records) - limit} more"),
+            *[literal("…") for _ in table.columns[1:]],
         )
     return table
 
 
-def node_table(snapshot: Snapshot, partition: str, limit: int = 0) -> Table:
+def node_table(snapshot: Snapshot, partition: str, limit: int = 0, width: int = 100) -> Table:
     nodes = [node for node in snapshot.nodes if partition in node.partitions]
-    table = Table(title=literal(f"{partition}: {len(nodes)} nodes"), expand=True)
-    for name in ["Node", "State", "CPU used/total", "GPU free/total"]:
-        table.add_column(name, overflow="ellipsis", no_wrap=True)
+    narrow = width < 75
+    table = Table(
+        title=literal(f"{partition}: {len(nodes)} nodes"), caption=gpu_legend(), expand=True
+    )
+    table.add_column(
+        "Node / state" if narrow else "Node",
+        max_width=max(10, width // 3),
+        overflow="ellipsis",
+        no_wrap=True,
+    )
+    if not narrow:
+        table.add_column("State", max_width=18, overflow="ellipsis", no_wrap=True)
+        table.add_column("CPU used/total", no_wrap=True)
+    table.add_column("GPU allocation", ratio=2, overflow="fold")
     for node in nodes[: limit or None]:
-        table.add_row(
-            literal(node.name),
-            literal("+".join(node.states)),
-            literal(f"{fmt_count(node.used_cpus)}/{fmt_count(node.cpus)}"),
-            literal(f"{fmt_count(node.free_gpus)}/{fmt_count(node.gpus)}"),
+        row = [
+            Text.assemble(literal(node.name), "\n", literal("+".join(node.states)))
+            if narrow
+            else literal(node.name)
+        ]
+        if not narrow:
+            row += [
+                literal("+".join(node.states)),
+                literal(f"{fmt_count(node.used_cpus)}/{fmt_count(node.cpus)}"),
+            ]
+        row.append(
+            gpu_meter(node.gpus, node.used_gpus, node.free_gpus, 10 if narrow else 16, narrow)
         )
+        table.add_row(*row)
     if limit and len(nodes) > limit:
         table.add_row(
             literal(f"{len(nodes) - limit} hidden"),
-            literal("--max-jobs 0"),
-            literal("…"),
-            literal("…"),
+            *[literal("…") for _ in table.columns[1:]],
         )
     return table
 
@@ -1555,8 +1674,17 @@ def render_snapshot(
     header = f"SLURM Monitor | {'all users' if args.all_users else user} | GPUs allocated {fmt_count(used)}/{fmt_count(total)} (unique nodes)"
     footer = f"Refresh: {args.interval:g}s | {datetime.fromtimestamp(snapshot.collected_at).strftime('%H:%M:%S')} | Slack queued: {pending} | endings awaiting accounting: {waiting} | Ctrl+C exits"
     limit = args.max_jobs
+    show_inventory = (
+        not args.compact and not args.partition and width >= 40 and (not terminal or height >= 28)
+    )
+    inventory_limit = max(1, (height - 24) // 6 if width < 75 else height // 8) if terminal else 0
     if terminal and limit and not args.job:
-        limit = max(1, min(limit, height - (12 if args.compact or width < 100 else 23)))
+        budget = (
+            26 + inventory_limit * (2 if width < 75 else 1)
+            if show_inventory or args.partition and not args.compact
+            else 12
+        )
+        limit = max(1, min(limit, height - budget))
     if terminal and height < 12:
         message = [
             header,
@@ -1578,9 +1706,10 @@ def render_snapshot(
         )
     parts.append(job_table(jobs, limit, width < 100))
     if args.partition and not args.compact:
-        parts.append(node_table(snapshot, args.partition, limit))
-    elif not args.compact and width >= 100 and (not terminal or height >= 28):
-        parts.append(gpu_table(snapshot, user, max(1, height // 5) if terminal else 0, jobs))
+        node_limit = min(limit, inventory_limit) if terminal and limit else limit
+        parts.append(node_table(snapshot, args.partition, node_limit, width))
+    elif show_inventory:
+        parts.append(gpu_table(snapshot, user, inventory_limit, jobs, width))
     if args.job:
         selected = next((job for job in jobs if job.id == args.job), None)
         if selected is None:

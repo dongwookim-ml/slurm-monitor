@@ -22,7 +22,7 @@ chmod +x ~/bin/slurm-monitor
 pip install -r requirements.txt
 ```
 
-The new CLI options are in source version 0.2.0; an older published package may not contain them.
+The new CLI options and restored GPU bars are in source version 0.2.1; an older published package may not contain them.
 
 ## Use
 
@@ -45,6 +45,8 @@ Existing `-1`, `-a`, `-c`, `-p`, `-i` and `-s` flags are preserved. Refresh inte
 Jobs use allocated TRES rather than per-node GRES multiplied in selected views. Nodes use `GresUsed`, with `AllocTRES` as a fallback. Generic and typed TRES counts are not added twice. Down/drained/unresponsive nodes contribute no free GPUs. Drained GRES are also removed from the free count. Missing allocation/type detail remains unknown; CPU usage is never used to guess GPU usage.
 
 The header counts physical nodes once. A node may belong to multiple partitions, so **partition totals can overlap and must not be summed**. The same physical allocation is reflected in each partition containing that node. Run/Pend counts describe the visible job scope; Mine describes the current user's visible allocations.
+
+Partition and per-node GPU bars show **red `█` used**, **green `░` idle**, **gray `×` unavailable**, and **yellow `?` unknown**. Symbols and the U/I/X legend remain readable without color. Counts follow the bar, or appear beneath it on narrow terminals. Unavailable means the remaining inventory cannot currently be offered as idle, including down/drained nodes or an inactive partition. Unknown allocation remains `?`, never idle. Zero-total partitions show “No GPUs”. Bars are rounded to character cells; small nonzero segments stay visible and the exact counts are authoritative.
 
 Free means unallocated GPUs on active nodes. CPU/memory availability, reservations, account/QoS policy, exclusivity, feature expressions, topology, licenses and scheduler placement can still prevent their use. The dashboard measures SLURM allocations, not GPU device utilization.
 
