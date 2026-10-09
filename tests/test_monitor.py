@@ -368,6 +368,7 @@ def test_slack_batch_limit_and_safe_mentions(snapshot):
         (urllib.error.HTTPError(WEBHOOK, 500, "server", {}, None), True),
         (urllib.error.HTTPError(WEBHOOK, 403, "forbidden", {}, None), False),
     ],
+    ids=["timeout", "transport", "rate-limit", "server", "forbidden"],
 )
 def test_slack_transport_failures_are_retained_and_redacted(monkeypatch, exception, retry):
     monkeypatch.setattr(sm.urllib.request, "urlopen", Mock(side_effect=exception))
