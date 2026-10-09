@@ -77,7 +77,7 @@ def test_narrow_live_dashboard_keeps_inventory_and_compact_mode(snapshot):
         sm.render_snapshot(snapshot, tracker, sm.parse_args([]), "alice", 42, 40, True), 42
     )
     assert "GPU allocation" in output and "U10 I8 X16 /34" in output
-    assert "more" in output  # Limited inventory advertises hidden partitions.
+    assert "more" not in output  # The three partitions fit; no arbitrary cap.
     compact = render(
         sm.render_snapshot(snapshot, tracker, sm.parse_args(["--compact"]), "alice", 42, 40, True),
         42,

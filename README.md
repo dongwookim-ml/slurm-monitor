@@ -22,7 +22,7 @@ chmod +x ~/bin/slurm-monitor
 pip install -r requirements.txt
 ```
 
-The new CLI options and restored GPU bars are in source version 0.2.1; an older published package may not contain them.
+The new CLI options, restored GPU bars and viewport fitting are in source version 0.2.2; an older published package may not contain them.
 
 ## Use
 
@@ -38,7 +38,7 @@ slurm-monitor -1 --job 12345_2          # Historical array task / exit diagnosti
 slurm-monitor --json                   # One machine-readable snapshot
 ```
 
-Existing `-1`, `-a`, `-c`, `-p`, `-i` and `-s` flags are preserved. Refresh intervals must be finite and at least one second. `--max-jobs` defaults to 15; zero shows all. Hidden row counts are explicit and narrow terminals use fewer columns. Non-interactive output automatically emits one snapshot. Exit codes are 0 for a successful snapshot or Ctrl+C, 1 for query errors, and 2 for invalid configuration.
+Existing `-1`, `-a`, `-c`, `-p`, `-i` and `-s` flags are preserved. Refresh intervals must be finite and at least one second. The live view measures actual wrapped table heights and shares available space between jobs, GPU inventory/node details and recent endings. It shows all rows that fit; a shorter section returns its unused space to the others. Hidden row counts appear when rows do not fit or an explicit `--max-jobs N` cap applies. The default and `--max-jobs 0` impose no manual cap; live output still fits the viewport, while `--once` and non-interactive output show all rows. Very small viewports use a bounded overview. Narrow terminals use fewer columns. Non-interactive output automatically emits one snapshot. Exit codes are 0 for a successful snapshot or Ctrl+C, 1 for query errors, and 2 for invalid configuration.
 
 ## What the numbers mean
 

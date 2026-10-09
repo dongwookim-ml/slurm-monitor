@@ -491,7 +491,7 @@ def test_terminal_literal_text_hidden_counts_and_actual_interval(snapshot):
         width=45,
         height=8,
     )
-    assert "SLURM Monitor" in output and "Refresh 12s" in output
+    assert "SLURM Monitor" in output and "Refresh: 12s" in output
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "0.5"])
@@ -643,7 +643,12 @@ def test_partition_live_tracking_and_interrupt_are_persisted(tmp_path, monkeypat
     monkeypatch.setattr(
         sm,
         "Console",
-        lambda: Console(file=io.StringIO(), force_terminal=True, width=120, height=40),
+        lambda **options: Console(
+            file=io.StringIO(),
+            force_terminal=True,
+            width=options.get("width", 120),
+            height=options.get("height", 40),
+        ),
     )
     live = Mock()
     live.__enter__ = Mock(return_value=live)

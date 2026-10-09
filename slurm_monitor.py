@@ -31,7 +31,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 TERMINAL = {
     "COMPLETED",
     "FAILED",
@@ -1384,7 +1384,7 @@ def job_table(jobs: list[Job], limit: int, narrow: bool = False) -> Table:
     shown = jobs if limit == 0 else jobs[:limit]
     title = f"Jobs: {len(shown)}/{len(jobs)} shown"
     if len(shown) < len(jobs):
-        title += f" ({len(jobs) - len(shown)} hidden; --max-jobs 0 shows all)"
+        title += f" ({len(jobs) - len(shown)} hidden)"
     table = Table(title=literal(title), expand=True, show_lines=False)
     for name in (
         ["ID", "Name", "State", "GPU", "Reason / exit"]
@@ -1673,28 +1673,7 @@ def render_snapshot(
     used = known_sum([node.used_gpus for node in snapshot.nodes])
     header = f"SLURM Monitor | {'all users' if args.all_users else user} | GPUs allocated {fmt_count(used)}/{fmt_count(total)} (unique nodes)"
     footer = f"Refresh: {args.interval:g}s | {datetime.fromtimestamp(snapshot.collected_at).strftime('%H:%M:%S')} | Slack queued: {pending} | endings awaiting accounting: {waiting} | Ctrl+C exits"
-    limit = args.max_jobs
-    show_inventory = (
-        not args.compact and not args.partition and width >= 40 and (not terminal or height >= 28)
-    )
-    inventory_limit = max(1, (height - 24) // 6 if width < 75 else height // 8) if terminal else 0
-    if terminal and limit and not args.job:
-        budget = (
-            26 + inventory_limit * (2 if width < 75 else 1)
-            if show_inventory or args.partition and not args.compact
-            else 12
-        )
-        limit = max(1, min(limit, height - budget))
-    if terminal and height < 12:
-        message = [
-            header,
-            f"{len(jobs)} jobs; {len(errors)} query/delivery errors. Refresh {args.interval:g}s.",
-        ]
-        message += [f"{job.id} {job.state} {job.name}" for job in jobs[: max(1, height - 6)]]
-        if len(jobs) > max(1, height - 6):
-            message.append("More jobs hidden; resize or use --once --max-jobs 0.")
-        message += errors[:1]
-        return Group(Text("\n".join(clean(line) for line in message)))
+    cap = args.max_jobs or 0
     parts = [Panel(literal(header), style="cyan")]
     if errors:
         parts.append(
@@ -1704,12 +1683,24 @@ def render_snapshot(
                 style="red",
             )
         )
-    parts.append(job_table(jobs, limit, width < 100))
+    # Each section supplies its actual Rich table; row height can vary with width.
+    sections = [
+        (min(len(jobs), cap) if cap else len(jobs), lambda rows: job_table(jobs, rows, width < 100))
+    ]
+    inventory = []
     if args.partition and not args.compact:
-        node_limit = min(limit, inventory_limit) if terminal and limit else limit
-        parts.append(node_table(snapshot, args.partition, node_limit, width))
-    elif show_inventory:
-        parts.append(gpu_table(snapshot, user, inventory_limit, jobs, width))
+        nodes = [node for node in snapshot.nodes if args.partition in node.partitions]
+        sections.append(
+            (
+                min(len(nodes), cap) if cap else len(nodes),
+                lambda rows: node_table(snapshot, args.partition, rows, width),
+            )
+        )
+    elif not args.compact and width >= 40:
+        inventory = gpu_summary(snapshot, user)
+        sections.append((len(inventory), lambda rows: gpu_table(snapshot, user, rows, jobs, width)))
+    bottom = []
+    history = []
     if args.job:
         selected = next((job for job in jobs if job.id == args.job), None)
         if selected is None:
@@ -1733,11 +1724,11 @@ def render_snapshot(
                         },
                     }
                 )
-            parts.append(
+            bottom.append(
                 diagnostic_panel(selected, snapshot, args.partition, terminal and height < 35)
             )
         else:
-            parts.append(
+            bottom.append(
                 Panel(
                     literal("Job not visible; accounting may be delayed, disabled or restricted."),
                     title="Job diagnostics",
@@ -1746,16 +1737,99 @@ def render_snapshot(
     else:
         with tracker.lock:
             history = tracker.history[:3]
-        if history and (not terminal or height >= 35):
-            parts.append(job_table(history, 3, width < 100))
-    parts += [
+        if history:
+            sections.append((len(history), lambda rows: job_table(history, rows, width < 100)))
+    bottom += [
         literal(
             "* Free = unallocated GPUs on active nodes. CPU/memory, reservations and partition policy can still prevent scheduling. ? = unknown.",
             "dim",
         ),
         literal(footer, "dim"),
     ]
-    return Group(*parts)
+    if not terminal:
+        return Group(*parts, *(factory(count) for count, factory in sections), *bottom)
+
+    console = Console(width=max(1, width), height=max(1, height))
+    options = console.options.update(height=None)
+
+    def measure(value) -> int:
+        return len(console.render_lines(value, options, pad=False))
+
+    fixed_height = sum(measure(value) for value in [*parts, *bottom])
+    maximum = [min(count, max(1, height)) for count, _ in sections]
+    rows = list(maximum)
+    cache = [{} for _ in sections]
+
+    def section_height(index: int, count: int) -> int:
+        if count not in cache[index]:
+            cache[index][count] = measure(sections[index][1](count))
+        return cache[index][count]
+
+    def total_height(counts: list[int]) -> int:
+        return fixed_height + sum(section_height(i, count) for i, count in enumerate(counts))
+
+    # Start with all eligible rows and trim the tallest section only when necessary.
+    while total_height(rows) > height:
+        candidates = [i for i, count in enumerate(rows) if count > 1]
+        if not candidates:
+            break
+        index = max(candidates, key=lambda i: section_height(i, rows[i]))
+        rows[index] -= 1
+    if total_height(rows) <= height:
+        # Reclaim slack caused by wrapped headers or disappearance of a "more" row.
+        while True:
+            grew = False
+            for i, maximum_rows in enumerate(maximum):
+                if rows[i] >= maximum_rows:
+                    continue
+                for candidate in dict.fromkeys([rows[i] + 1, maximum_rows]):
+                    trial = list(rows)
+                    trial[i] = candidate
+                    if total_height(trial) <= height:
+                        rows = trial
+                        grew = True
+                        break
+            if not grew:
+                break
+        return Group(
+            *parts, *(factory(count) for (_, factory), count in zip(sections, rows)), *bottom
+        )
+
+    # If even one row per table cannot fit, use a bounded overview instead of clipping controls.
+    overview = [
+        literal(f"SLURM Monitor | GPUs {fmt_count(used)}/{fmt_count(total)}"),
+        literal(f"Jobs {len(jobs)} | {len(errors)} errors | Slack queued {pending}"),
+        literal("█ used  ░ idle  × unavailable  ? unknown", "dim"),
+    ]
+    if errors:
+        overview.append(literal("Error: " + errors[0], "red"))
+    previews = []
+    for record in inventory:
+        previews.append(
+            Text.assemble(
+                literal(record["name"] + " "),
+                gpu_meter(record["total"], record["used"], record["free"], 6),
+            )
+        )
+    previews += [literal(f"{job.id} {job.state} {job.name}") for job in jobs[: cap or None]]
+    previews += [literal(f"Recent: {job.id} {job.state} {job.name}") for job in history]
+    if args.partition and not args.compact:
+        previews += [
+            Text.assemble(
+                literal(node.name + " "), gpu_meter(node.gpus, node.used_gpus, node.free_gpus, 6)
+            )
+            for node in nodes[: cap or None]
+        ]
+    available = max(0, height - len(overview) - 1)
+    shown = available if len(previews) <= available else max(0, available - 1)
+    overview += previews[:shown]
+    if shown < len(previews) and available:
+        overview.append(literal(f"{len(previews) - shown} rows hidden; --once shows full tables"))
+    overview.append(literal(f"Refresh: {args.interval:g}s | awaiting sacct: {waiting} | Ctrl+C"))
+    overview = overview[: max(0, height)]
+    for line in overview:
+        line.truncate(max(1, width), overflow="ellipsis")
+    return Group(*overview)
 
 
 def positive_interval(value: str) -> float:
@@ -1808,7 +1882,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Inspect pending suitability or completed exit information",
     )
     parser.add_argument(
-        "--max-jobs", type=nonnegative, default=15, help="Row limit; 0 shows all (default 15)"
+        "--max-jobs",
+        type=nonnegative,
+        default=None,
+        help="Optional job/node row cap; default or 0 fits the live viewport; --once shows all",
     )
     parser.add_argument(
         "--json", action="store_true", help="One read-only machine-readable snapshot"
